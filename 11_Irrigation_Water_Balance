@@ -1,0 +1,268 @@
+exports.unavailableReason = function(options) {
+  if (!options.referenceET) {
+    return 'A daily referenceET ImageCollection with ET0_mm is required.';
+  }
+
+  var kc = options.cropCoefficient;
+
+  if (
+    typeof kc !== 'number' ||
+    !isFinite(kc) ||
+    kc <= 0
+  ) {
+    return 'A finite positive crop coefficient is required.';
+  }
+
+  if (
+    options.referenceETUnits !== undefined &&
+    options.referenceETUnits !== 'mm/day'
+  ) {
+    return 'referenceET units must be mm/day; convert inputs before loading.';
+  }
+
+  return null;
+};
+
+exports.screeningTotals = function(et, rain, coefficient) {
+  if (
+    typeof coefficient !== 'number' ||
+    !isFinite(coefficient) ||
+    coefficient <= 0
+  ) {
+    throw new Error('Positive crop coefficient required.');
+  }
+
+  if (
+    !et || !rain || !et.length ||
+    et.length !== rain.length
+  ) {
+    return null;
+  }
+
+  var totalET = 0;
+  var totalRain = 0;
+
+  for (var i = 0; i < et.length; i++) {
+    if (
+      et[i] === null ||
+      et[i] === undefined ||
+      rain[i] === null ||
+      rain[i] === undefined
+    ) {
+      return null;
+    }
+
+    if (
+      typeof et[i] !== 'number' ||
+      typeof rain[i] !== 'number' ||
+      !isFinite(et[i]) ||
+      !isFinite(rain[i]) ||
+      et[i] < 0 ||
+      rain[i] < 0
+    ) {
+      throw new Error(
+        'Daily measurements must be finite nonnegative numbers.'
+      );
+    }
+
+    totalET += et[i];
+    totalRain += rain[i];
+  }
+
+  var etc = totalET * coefficient;
+  var deficit = Math.max(0, etc - totalRain);
+
+  return {
+    ET0_mm: totalET,
+    ETc_mm: etc,
+    Rain_mm: totalRain,
+    Deficit_mm: deficit,
+    Demand_m3_ha: deficit * 10
+  };
+};
+
+exports.load = function(options) {
+  options = options || {};
+
+  var U = require(
+    'users/pushkkal0201/pheno-crop-analytics:modules/01_Data_Preprocessing'
+  );
+
+  var data = U.copy(options.data || {});
+  var C = data.CONFIG || options.config || {};
+  var reason = exports.unavailableReason(options);
+
+  if (
+    !reason &&
+    (
+      !data.aoi ||
+      !data.recentStart ||
+      !data.END_DATE ||
+      !data.chirps
+    )
+  ) {
+    reason = 'Prepared AOI, dates and CHIRPS rainfall are required.';
+  }
+
+  var bands = [
+    'ET0_mm',
+    'ETc_mm',
+    'Rain_mm',
+    'Deficit_mm',
+    'Demand_m3_ha'
+  ];
+
+  data.waterAvailable = !reason;
+
+  if (reason) {
+    data.waterBalance = U.empty(bands, C);
+
+    data.waterSummary = ee.Dictionary({
+      status: 'unavailable',
+      reason: reason,
+      interpretation: 'Quantitative screening requires actual ' +
+        'reference ET and applicable Kc.'
+    });
+
+    return data;
+  }
+
+  var start = ee.Date(data.recentStart);
+  var end = ee.Date(data.END_DATE);
+  var dayMS = 86400000;
+
+  var firstDay = start.millis().divide(dayMS).ceil();
+  var stopDay = end.millis().divide(dayMS).ceil();
+  var expectedDays = stopDay.subtract(firstDay);
+
+  var source = ee.ImageCollection(options.referenceET)
+    .filterDate(start, end)
+    .select('ET0_mm')
+    .map(function(image) {
+      return image.updateMask(image.gte(0));
+    });
+
+  var days = ee.List(ee.Algorithms.If(
+    expectedDays.gt(0),
+    ee.List.sequence(firstDay, stopDay.subtract(1)),
+    ee.List([])
+  ));
+
+  var daily = ee.ImageCollection.fromImages(
+    days.map(function(day) {
+      var date = ee.Date(
+        ee.Number(day).multiply(dayMS)
+      );
+
+      var observations = source.filterDate(
+        date,
+        date.advance(1, 'day')
+      );
+
+      return observations.merge(
+        ee.ImageCollection.fromImages([
+          U.empty(['ET0_mm'], C)
+        ])
+      )
+        .mean()
+        .rename('ET0_mm')
+        .set('system:time_start', date.millis());
+    })
+  ).merge(
+    ee.ImageCollection.fromImages([
+      U.empty(['ET0_mm'], C)
+    ])
+  );
+
+  var etCoverage = daily.count()
+    .unmask(0)
+    .rename('ET_Days');
+
+  var validET = etCoverage.eq(expectedDays)
+    .and(ee.Image.constant(expectedDays.gt(0)));
+
+  var et0 = daily.sum()
+    .rename('ET0_mm')
+    .updateMask(validET);
+
+  var rainDaily = ee.ImageCollection(data.chirps)
+    .filterDate(start, end)
+    .select('precipitation')
+    .map(function(image) {
+      return image.updateMask(image.gte(0));
+    })
+    .merge(
+      ee.ImageCollection.fromImages([
+        U.empty(['precipitation'], C)
+      ])
+    );
+
+  var rainCoverage = rainDaily.count()
+    .unmask(0)
+    .rename('Rain_Days');
+
+  var rain = rainDaily.sum()
+    .rename('Rain_mm')
+    .updateMask(
+      rainCoverage.eq(expectedDays)
+        .and(ee.Image.constant(expectedDays.gt(0)))
+    );
+
+  var etc = et0.multiply(options.cropCoefficient)
+    .rename('ETc_mm');
+
+  var deficit = etc.subtract(rain)
+    .max(0)
+    .rename('Deficit_mm');
+
+  data.waterBalance = et0
+    .addBands(etc)
+    .addBands(rain)
+    .addBands(deficit)
+    .addBands(
+      deficit.multiply(10).rename('Demand_m3_ha')
+    )
+    .clip(data.aoi);
+
+  data.waterCoverage = etCoverage
+    .addBands(rainCoverage)
+    .clip(data.aoi);
+
+  var means = U.stats(
+    data.waterBalance,
+    data.aoi,
+    C
+  );
+
+  data.waterSummary = means.combine(
+    ee.Dictionary({
+      status: ee.Algorithms.If(
+        ee.Algorithms.IsEqual(means.get('Deficit_mm'), null),
+        'unavailable',
+        'ready'
+      ),
+      input_prerequisites_supplied: true,
+      crop_coefficient: options.cropCoefficient,
+      expected_days: expectedDays,
+      recent_start: start.format(),
+      recent_end_exclusive: end.format(),
+      units: 'ET0_mm, ETc_mm, Rain_mm, Deficit_mm=period-total mm; ' +
+        'Demand_m3_ha=m3 per hectare',
+      coverage_rule: 'Every selected UTC daily timestamp must have ' +
+        'valid ET and rainfall; missing days remain masked.',
+      interpretation: 'Simple potential demand screening: ' +
+        'ETc=Kc*ET0, deficit=max(ETc-total rain,0).',
+      limitations: 'No soil-water storage, effective rainfall, runoff, ' +
+        'irrigation efficiency, calibrated Kc extraction or farm prescription.',
+      crop_calendar_status: options.cropCalendar
+        ? 'Supplied as information only; scalar cropCoefficient remains the applied Kc.'
+        : 'Not supplied; scalar cropCoefficient applied.',
+      input_schema_note: 'ET0_mm requires daily reference evapotranspiration ' +
+        'with valid system:time_start and mm/day units; ' +
+        'negative values are rejected by masking.'
+    }),
+    true
+  );
+
+  return data;
+};
