@@ -1,0 +1,99 @@
+exports.load = function(options) {
+  var U = require(
+    'users/pushkkal0201/pheno-crop-analytics:modules/01_Data_Preprocessing'
+  );
+
+  var d = U.copy(options.data);
+  var C = d.CONFIG;
+
+  // Heuristic index, not measured yield in tonnes/hectare.
+  d.yieldIndex = d.healthScore.multiply(0.7)
+    .add(d.NDMI.add(1).divide(2).multiply(30))
+    .clamp(0, 100)
+    .rename('Yield_Index')
+    .updateMask(d.healthScore.mask());
+
+  d.priorityMap = d.weightedStressScore.multiply(0.7)
+    .add(
+      ee.Image.constant(100)
+        .subtract(d.healthScore)
+        .multiply(0.3)
+    )
+    .clamp(0, 100)
+    .rename('Action_Priority');
+
+  d.irrigationNeed = d.NDMI.lt(0.2)
+    .rename('Irrigation_Flag')
+    .updateMask(d.healthScore.mask());
+
+  d.heatStress = d.temperature.gt(35)
+    .rename('Heat_Flag')
+    .updateMask(d.healthScore.mask());
+
+  // Screening flag only; this does not diagnose a disease.
+  d.diseaseRiskIndicator = d.temperature.gte(25)
+    .and(d.temperature.lte(35))
+    .and(d.NDMI.gt(0.25))
+    .rename('Disease_Risk')
+    .updateMask(d.healthScore.mask());
+
+  d.reliabilityIndex = d.confidence
+    .rename('Reliability_Index');
+
+  d.analysisStack = d.monitoringStack.addBands([
+    d.yieldIndex,
+    d.priorityMap,
+    d.irrigationNeed,
+    d.heatStress,
+    d.diseaseRiskIndicator,
+    d.reliabilityIndex
+  ]);
+
+  d.districtAverages = U.stats(
+    d.analysisStack,
+    d.aoi,
+    C
+  );
+
+  var grids = d.aoi.coveringGrid(
+    ee.Projection(C.ANALYSIS_CRS),
+    C.GRID_METRES
+  ).map(function(f) {
+    return ee.Feature(
+      f.geometry().intersection(
+        d.aoi,
+        ee.ErrorMargin(1)
+      )
+    ).set(
+      'Grid_ID',
+      ee.String('GRID_').cat(f.id())
+    );
+  });
+
+  d.analysisGrids = grids;
+
+  d.gridRanking = d.analysisStack.reduceRegions({
+    collection: grids,
+    reducer: ee.Reducer.mean(),
+    scale: C.GRID_SCALE,
+    crs: C.ANALYSIS_CRS,
+    tileScale: 4
+  })
+    .filter(ee.Filter.notNull(['Action_Priority']))
+    .sort('Action_Priority', false);
+
+  d.decisionSummary = d.gridRanking.limit(20)
+    .map(function(f) {
+      return f.set(
+        'Advice',
+        ee.Algorithms.If(
+          ee.Number(f.get('Action_Priority')).gte(50),
+          'Inspect vegetation/moisture change; verify in field',
+          'Monitor next observation'
+        )
+      );
+    });
+
+  d.status04 = 'ready';
+  return d;
+};
