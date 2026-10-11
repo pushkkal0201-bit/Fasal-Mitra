@@ -1,0 +1,519 @@
+
+
+
+var CFG = {
+  START: '2025-10-01',
+  END: '2026-10-01',
+  BUFFER_M: 10000,
+  SCALE: 10,
+  TREES: 150,
+  TRAIN_FRACTION: 0.75,
+  SEED: 42,
+  MASK_MAP_TO_CROPLAND: true,
+  EXPORT_FOLDER: 'PhenoCrop_Exports'
+};
+
+var cropNames = [
+  'Rice', 'Wheat', 'Sugarcane', 'Maize',
+  'Gram', 'Mustard', 'Vegetable', 'Fallow'
+];
+
+var palette = [
+  '229E75', 'E2B753', 'AD76BC', '56A7D5',
+  'E78B58', 'E2DB60', '8DD18A', '929DA5'
+];
+
+// Read existing Earth Engine geometry imports.
+
+var imports = [
+  typeof rice_points !== 'undefined'
+    ? rice_points
+    : (typeof rice !== 'undefined' ? rice : null),
+
+  typeof wheat_points !== 'undefined'
+    ? wheat_points
+    : (typeof wheat !== 'undefined' ? wheat : null),
+
+  typeof sugarcane_points !== 'undefined'
+    ? sugarcane_points
+    : (typeof sugarcane !== 'undefined' ? sugarcane : null),
+
+  typeof maize_points !== 'undefined'
+    ? maize_points
+    : (typeof maize !== 'undefined' ? maize : null),
+
+  typeof gram_points !== 'undefined'
+    ? gram_points
+    : (typeof gram !== 'undefined' ? gram : null),
+
+  typeof mustard_points !== 'undefined'
+    ? mustard_points
+    : (typeof mustard !== 'undefined' ? mustard : null),
+
+  typeof vegetable_points !== 'undefined'
+    ? vegetable_points
+    : (typeof vegetables_points !== 'undefined'
+      ? vegetables_points : null),
+
+  typeof fallow_points !== 'undefined'
+    ? fallow_points
+    : (typeof fallow !== 'undefined' ? fallow : null)
+];
+
+var missing = [];
+
+for (var m = 0; m < imports.length; m++) {
+  if (imports[m] === null) {
+    missing.push(cropNames[m] + '_points');
+  }
+}
+
+if (missing.length) {
+  throw new Error(
+    'Missing Geometry Imports: ' +
+    missing.join(', ') +
+    '. Keep the imports from your original script.'
+  );
+}
+
+// Normalize FeatureCollections and geometries.
+
+function labelFeatures(value, classId) {
+  var source = ee.FeatureCollection(value);
+  var list = source.toList(5000);
+
+  return ee.FeatureCollection(
+    list.map(function(item) {
+      var feature = ee.Feature(item);
+
+      return ee.FeatureCollection(
+        feature.geometry().geometries().map(function(g) {
+          return ee.Feature(ee.Geometry(g))
+            .copyProperties(feature)
+            .set('class_id', classId);
+        })
+      );
+    })
+  ).flatten();
+}
+
+var labelled = ee.FeatureCollection([]);
+
+for (var i = 0; i < 8; i++) {
+  labelled = labelled.merge(
+    labelFeatures(imports[i], i)
+  );
+}
+
+// Include all imported points in the study area.
+
+var region = labelled.geometry()
+  .bounds(ee.ErrorMargin(100))
+  .buffer(CFG.BUFFER_M, ee.ErrorMargin(100))
+  .bounds(ee.ErrorMargin(100));
+
+Map.setOptions('SATELLITE');
+Map.centerObject(region, 10);
+
+// Four seasonal windows.
+
+var boundaries = [
+  ee.Date(CFG.START),
+  ee.Date(CFG.START).advance(3, 'month'),
+  ee.Date(CFG.START).advance(6, 'month'),
+  ee.Date(CFG.START).advance(9, 'month'),
+  ee.Date(CFG.END)
+];
+
+if (Date.parse(CFG.END) <= Date.parse(CFG.START)) {
+  throw new Error('END must be after START.');
+}
+
+// Sentinel-2 preprocessing.
+
+var s2bands = [
+  'B2', 'B3', 'B4', 'B5', 'B8', 'B11', 'B12'
+];
+
+function maskS2(image) {
+  var scl = image.select('SCL');
+
+  var good = scl.neq(0)
+    .and(scl.neq(1))
+    .and(scl.neq(3))
+    .and(scl.neq(8))
+    .and(scl.neq(9))
+    .and(scl.neq(10))
+    .and(scl.neq(11));
+
+  var refl = image.updateMask(good)
+    .select(s2bands)
+    .divide(10000);
+
+  var ndvi = refl.normalizedDifference(
+    ['B8', 'B4']
+  ).rename('NDVI');
+
+  var ndmi = refl.normalizedDifference(
+    ['B8', 'B11']
+  ).rename('NDMI');
+
+  var ndre = refl.normalizedDifference(
+    ['B8', 'B5']
+  ).rename('NDRE');
+
+  var evi = refl.expression(
+    '2.5*(n-r)/(n+6*r-7.5*b+1)',
+    {
+      n: refl.select('B8'),
+      r: refl.select('B4'),
+      b: refl.select('B2')
+    }
+  ).rename('EVI');
+
+  return refl.addBands(
+    ee.Image.cat([ndvi, ndmi, ndre, evi])
+  ).copyProperties(image, ['system:time_start']);
+}
+
+// Load satellite collections.
+
+var s2 = ee.ImageCollection(
+  'COPERNICUS/S2_SR_HARMONIZED'
+)
+  .filterBounds(region)
+  .filterDate(CFG.START, CFG.END)
+  .filter(
+    ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 85)
+  )
+  .map(maskS2);
+
+var s1 = ee.ImageCollection(
+  'COPERNICUS/S1_GRD'
+)
+  .filterBounds(region)
+  .filterDate(CFG.START, CFG.END)
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(
+    ee.Filter.listContains(
+      'transmitterReceiverPolarisation', 'VV'
+    )
+  )
+  .filter(
+    ee.Filter.listContains(
+      'transmitterReceiverPolarisation', 'VH'
+    )
+  )
+  .select(['VV', 'VH']);
+
+// Safe handling of empty image collections.
+
+function emptyImage(bands) {
+  return ee.Image.constant(
+    bands.map(function() { return 0; })
+  )
+    .rename(bands)
+    .updateMask(ee.Image.constant(0));
+}
+
+function safeMedian(collection, bands) {
+  return ee.Image(
+    ee.Algorithms.If(
+      collection.size().gt(0),
+      collection.select(bands).median(),
+      emptyImage(bands)
+    )
+  ).clip(region);
+}
+
+// Build temporal feature stack.
+
+var stack = null;
+var validBands = [];
+
+var displayRGB = safeMedian(
+  s2, ['B4', 'B3', 'B2']
+);
+
+for (var j = 0; j < 4; j++) {
+  var a = boundaries[j];
+  var b = boundaries[j + 1];
+
+  var opt = safeMedian(
+    s2.filterDate(a, b),
+    ['NDVI', 'NDMI', 'NDRE', 'EVI', 'B8', 'B11']
+  );
+
+  var radar = safeMedian(
+    s1.filterDate(a, b),
+    ['VV', 'VH']
+  );
+
+  var suffix = '_T' + (j + 1);
+
+  var opticalValidity = opt.select('NDVI')
+    .mask()
+    .unmask(0)
+    .rename('Optical_valid' + suffix)
+    .toFloat();
+
+  var radarValidity = radar.select('VV')
+    .mask()
+    .unmask(0)
+    .rename('Radar_valid' + suffix)
+    .toFloat();
+
+  var slice = opt.unmask(-1)
+    .rename(
+      ['NDVI', 'NDMI', 'NDRE', 'EVI', 'B8', 'B11']
+        .map(function(name) {
+          return name + suffix;
+        })
+    )
+    .addBands(
+      radar.unmask(-40)
+        .rename(['VV' + suffix, 'VH' + suffix])
+    )
+    .addBands(
+      ee.Image.cat([opticalValidity, radarValidity])
+    )
+    .toFloat();
+
+  stack = stack === null
+    ? slice
+    : stack.addBands(slice);
+
+  validBands.push(
+    'Optical_valid' + suffix,
+    'Radar_valid' + suffix
+  );
+}
+
+var hasAnyData = stack.select(validBands)
+  .reduce(ee.Reducer.max())
+  .gt(0);
+
+stack = stack.updateMask(hasAnyData).clip(region);
+
+var predictorNames = stack.bandNames();
+
+// Split labelled points before satellite sampling.
+
+var partitioned = labelled.randomColumn(
+  'random_split', CFG.SEED
+);
+
+var trainPts = partitioned.filter(
+  ee.Filter.lt('random_split', CFG.TRAIN_FRACTION)
+);
+
+var testPts = partitioned.filter(
+  ee.Filter.gte('random_split', CFG.TRAIN_FRACTION)
+);
+
+var training = stack.sampleRegions({
+  collection: trainPts,
+  properties: ['class_id'],
+  scale: CFG.SCALE,
+  tileScale: 4,
+  geometries: false
+}).filter(ee.Filter.notNull(predictorNames));
+
+var testing = stack.sampleRegions({
+  collection: testPts,
+  properties: ['class_id'],
+  scale: CFG.SCALE,
+  tileScale: 4,
+  geometries: false
+}).filter(ee.Filter.notNull(predictorNames));
+
+// Diagnostic information.
+
+print(
+  'Label counts by class',
+  labelled.aggregate_histogram('class_id')
+);
+
+print('Sentinel-2 scenes', s2.size());
+print('Sentinel-1 scenes', s1.size());
+
+print(
+  'Training/test sample counts',
+  training.size(),
+  testing.size()
+);
+
+print(
+  'Training distribution',
+  training.aggregate_histogram('class_id')
+);
+
+print(
+  'Validation distribution',
+  testing.aggregate_histogram('class_id')
+);
+
+// Check data before training.
+
+var checks = ee.Dictionary({
+  raw: labelled.size(),
+  train: training.size(),
+  test: testing.size(),
+  availableClasses: training.aggregate_array('class_id')
+    .distinct()
+    .sort(),
+  opticalScenes: s2.size(),
+  radarScenes: s1.size()
+});
+
+checks.evaluate(function(status, error) {
+  if (error) {
+    print('DATA ERROR: ' + error);
+    return;
+  }
+
+  if (
+    !status ||
+    status.train < 24 ||
+    status.test < 8 ||
+    status.availableClasses.length < 8 ||
+    (
+      status.opticalScenes < 1 &&
+      status.radarScenes < 1
+    )
+  ) {
+    print(
+      'TRAINING STOPPED: Check class coverage, ' +
+      'satellite dates and imported labels.',
+      status
+    );
+    return;
+  }
+
+  // Random Forest training.
+
+  var rf = ee.Classifier.smileRandomForest({
+    numberOfTrees: CFG.TREES,
+    minLeafPopulation: 1,
+    bagFraction: 0.7,
+    seed: CFG.SEED
+  }).train({
+    features: training,
+    classProperty: 'class_id',
+    inputProperties: predictorNames
+  });
+
+  // Evaluate on held-out point samples.
+
+  var evaluated = testing.classify(
+    rf, 'predicted'
+  );
+
+  var matrix = evaluated.errorMatrix(
+    'class_id',
+    'predicted',
+    [0, 1, 2, 3, 4, 5, 6, 7]
+  );
+
+  print('VALIDATION CONFUSION MATRIX', matrix);
+  print('VALIDATION ACCURACY', matrix.accuracy());
+  print('VALIDATION KAPPA', matrix.kappa());
+
+  print(
+    'PER-CLASS PRECISION',
+    matrix.consumersAccuracy()
+  );
+
+  print(
+    'PER-CLASS RECALL',
+    matrix.producersAccuracy()
+  );
+
+  print(
+    'FEATURE IMPORTANCE',
+    ee.Dictionary(rf.explain()).get('importance')
+  );
+
+  // Generate classification map.
+
+  var prediction = stack.classify(rf)
+    .rename('Crop_ID');
+
+  if (CFG.MASK_MAP_TO_CROPLAND) {
+    var worldcover = ee.ImageCollection(
+      'ESA/WorldCover/v200'
+    ).first().select('Map').eq(40);
+
+    prediction = prediction.updateMask(worldcover);
+  }
+
+  Map.addLayer(
+    displayRGB,
+    {
+      bands: ['B4', 'B3', 'B2'],
+      min: 0,
+      max: 0.3
+    },
+    'Sentinel-2 optical RGB',
+    true
+  );
+
+  Map.addLayer(
+    prediction,
+    {
+      min: 0,
+      max: 7,
+      palette: palette
+    },
+    'RF: eight-crop predicted map',
+    true
+  );
+
+  // Show the original labels as separate layers.
+
+  for (var k = 0; k < 8; k++) {
+    Map.addLayer(
+      ee.FeatureCollection(imports[k]),
+      {color: palette[k]},
+      cropNames[k] + ' ground labels',
+      false
+    );
+  }
+
+  Map.addLayer(
+    region,
+    {color: 'FFFFFF'},
+    'Training coverage boundary',
+    false
+  );
+
+  print(
+    'CLASS LEGEND: 0 Rice, 1 Wheat, ' +
+    '2 Sugarcane, 3 Maize, 4 Gram, ' +
+    '5 Mustard, 6 Vegetable, 7 Fallow'
+  );
+
+  // Exports are queued but require manual start.
+
+  Export.image.toDrive({
+    image: prediction.toByte(),
+    description: 'PhenoCrop_RF_8Crop_Map',
+    folder: CFG.EXPORT_FOLDER,
+    region: region,
+    scale: CFG.SCALE,
+    maxPixels: 1e13,
+    fileFormat: 'GeoTIFF'
+  });
+
+  Export.table.toDrive({
+    collection: evaluated,
+    description: 'PhenoCrop_Validation_Points',
+    folder: CFG.EXPORT_FOLDER,
+    fileFormat: 'CSV'
+  });
+
+  print(
+    'Model constructed. Inspect the validation ' +
+    'results and map layers before using predictions.'
+  );
+});
