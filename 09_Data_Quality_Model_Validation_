@@ -1,0 +1,449 @@
+exports.summarizeConfusion = function(matrix) {
+  var total = 0;
+  var correct = 0;
+
+  var rows = matrix.map(function(row, i) {
+    var support = row.reduce(function(a, b) {
+      return a + b;
+    }, 0);
+
+    var predicted = matrix.reduce(function(a, r) {
+      return a + r[i];
+    }, 0);
+
+    total += support;
+    correct += row[i];
+
+    return {
+      support: support,
+      predicted_support: predicted,
+      precision: predicted ? row[i] / predicted : null,
+      recall: support ? row[i] / support : null
+    };
+  });
+
+  return {
+    accuracy: total ? correct / total : null,
+    sample_count: total,
+    rows: rows
+  };
+};
+
+exports.validPredictorMask = function(image) {
+  return image.mask()
+    .reduce(ee.Reducer.min())
+    .selfMask();
+};
+
+exports.load = function(options) {
+  options = options || {};
+
+  var U = require(
+    'users/pushkkal0201/pheno-crop-analytics:modules/01_Data_Preprocessing'
+  );
+
+  var d = U.copy(options.data || {});
+  var C = d.CONFIG || {};
+
+  d.status09 = d.s2 ? 'partial' : 'unavailable';
+
+  var emptyMetrics = {
+    status: 'unavailable',
+    accuracy: null,
+    kappa: null,
+    sample_count: 0,
+    reason: 'Supply independent validationPoints and an available classifier.'
+  };
+
+  d.independentValidationAvailable = false;
+  d.independentValidation = ee.FeatureCollection([]);
+  d.independentValidationPerClass = ee.FeatureCollection([]);
+  d.independentValidationMetrics = ee.Dictionary(emptyMetrics);
+  d.independentConfusionMatrix = null;
+
+  d.temporalValidationAvailable = false;
+  d.temporalValidation = ee.FeatureCollection([]);
+  d.temporalValidationPerClass = ee.FeatureCollection([]);
+
+  d.temporalValidationMetrics = ee.Dictionary({
+    status: 'unavailable',
+    accuracy: null,
+    kappa: null,
+    reason: 'Supply dated precomputed temporalValidationSamples, ' +
+      'held-out season provenance and temporalValidationReady=true.'
+  });
+
+  d.quality = ee.Dictionary({
+    status: 'unavailable',
+    reason: 'Prepared observation context is missing.',
+    source_metadata: d.metadata || ee.Dictionary({})
+  });
+
+  if (d.s2 && d.END_DATE && d.aoi) {
+    function freshness(collection) {
+      var last = collection.aggregate_max('system:time_start');
+      var latest = U.safeNumber(last, 0);
+
+      return ee.Dictionary({
+        scene_count: collection.size(),
+        latest_time: ee.Algorithms.If(
+          collection.size().gt(0), latest, null
+        ),
+        age_days_at_cutoff: ee.Algorithms.If(
+          collection.size().gt(0),
+          d.END_DATE.millis()
+            .subtract(latest)
+            .divide(86400000),
+          null
+        )
+      });
+    }
+
+    function fraction(image) {
+      var area = ee.Image.pixelArea().rename('area');
+
+      var args = {
+        reducer: ee.Reducer.sum(),
+        geometry: d.aoi,
+        scale: C.STATS_SCALE,
+        crs: C.ANALYSIS_CRS,
+        maxPixels: 1e9,
+        tileScale: 4
+      };
+
+      var denominator = U.safeNumber(
+        area.reduceRegion(args).get('area'), 0
+      );
+
+      var numerator = U.safeNumber(
+        area.updateMask(image.mask())
+          .reduceRegion(args)
+          .get('area'),
+        0
+      );
+
+      return ee.Number(ee.Algorithms.If(
+        denominator.gt(0),
+        numerator.divide(denominator.max(1)),
+        0
+      ));
+    }
+
+    var ndviFraction = fraction(d.NDVI);
+
+    var predictorsFraction = fraction(
+      exports.validPredictorMask(d.featureStack)
+        .rename('valid')
+    );
+
+    d.quality = ee.Dictionary({
+      status: ee.Algorithms.If(
+        ndviFraction.gt(0), 'partial', 'unavailable'
+      ),
+      optical_history: freshness(d.s2),
+      optical_recent: freshness(
+        d.s2.filterDate(d.recentStart, d.END_DATE)
+      ),
+      recent_ndvi_valid_fraction: ndviFraction,
+      all_predictors_valid_fraction: predictorsFraction,
+      source_metadata: d.metadata || ee.Dictionary({}),
+      stats_scale_m: C.STATS_SCALE,
+      freshness_semantics: 'Age relative to exclusive analysis cutoff; ' +
+        'scene count does not guarantee unmasked observations.',
+      training_diagnostics: d.trainingDiagnostics ||
+        ee.Dictionary({status: 'unavailable'}),
+      temporal_generalization: 'Unavailable unless a separate dated ' +
+        'held-out season passes the explicit input gate.'
+    });
+
+    if (d.s1) {
+      d.quality = d.quality.set(
+        'sar_history', freshness(d.s1)
+      );
+    }
+    if (d.chirps) {
+      d.quality = d.quality.set(
+        'rain_history', freshness(d.chirps)
+      );
+    }
+    if (d.era5) {
+      d.quality = d.quality.set(
+        'weather_history', freshness(d.era5)
+      );
+    }
+  }
+
+  if (!d.classifier) {
+    return d;
+  }
+
+  var predictors = d.predictorNames ||
+    (d.featureStack ? d.featureStack.bandNames() : null);
+
+  if (!predictors) {
+    d.independentValidationMetrics = ee.Dictionary({
+      status: 'unavailable',
+      accuracy: null,
+      reason: 'Classifier inference predictor schema is missing.'
+    });
+    return d;
+  }
+
+  var sourceProperty = options.validationSourceProperty ||
+    C.SOURCE_ID_PROPERTY ||
+    'source_id';
+
+  var offset = typeof d.classifierClassOffset === 'number'
+    ? d.classifierClassOffset
+    : 0;
+
+  var trainingSources = d.trainingSourceFeatures ||
+    d.trainingSamples;
+
+  var buffer = typeof C.VALIDATION_BUFFER_M === 'number'
+    ? C.VALIDATION_BUFFER_M
+    : 100;
+
+  function labels(collection) {
+    var valid = collection
+      .filter(ee.Filter.notNull(['class', sourceProperty]))
+      .filter(ee.Filter.gte('class', 1))
+      .filter(ee.Filter.lte('class', 8));
+
+    return valid.map(function(f) {
+      var id = ee.Number(f.get('class'));
+      return f.set('_integer_class', id.eq(id.floor()));
+    }).filter(ee.Filter.eq('_integer_class', 1));
+  }
+
+  function separate(collection, spatial) {
+    if (!trainingSources) {
+      return collection;
+    }
+
+    var sources = ee.FeatureCollection(trainingSources);
+
+    var disjoint = ee.FeatureCollection(
+      ee.Join.inverted().apply(
+        collection,
+        sources,
+        ee.Filter.equals({
+          leftField: sourceProperty,
+          rightField: sourceProperty
+        })
+      )
+    );
+
+    if (spatial) {
+      disjoint = ee.FeatureCollection(
+        ee.Join.inverted().apply(
+          disjoint,
+          sources,
+          ee.Filter.withinDistance({
+            distance: buffer,
+            leftField: '.geo',
+            rightField: '.geo',
+            maxError: 1
+          })
+        )
+      );
+    }
+
+    return disjoint;
+  }
+
+  function evaluate(samples, extra) {
+    var complete = samples.filter(
+      ee.Filter.notNull(predictors)
+    );
+
+    var predictions = complete
+      .classify(d.classifier, '_prediction_internal')
+      .map(function(f) {
+        return f.set(
+          'predicted_class',
+          ee.Number(f.get('_prediction_internal')).add(offset)
+        );
+      });
+
+    var order = ee.List.sequence(1, 8);
+
+    var matrix = predictions.errorMatrix(
+      'class',
+      'predicted_class',
+      order
+    );
+
+    var values = ee.List(matrix.array().toList());
+    var axes = ee.List.sequence(0, 7);
+
+    var perClass = ee.FeatureCollection(
+      axes.map(function(i) {
+        i = ee.Number(i);
+
+        var row = ee.List(values.get(i));
+        var support = ee.Number(
+          row.reduce(ee.Reducer.sum())
+        );
+
+        var predictedSupport = ee.Number(
+          values.map(function(r) {
+            return ee.List(r).get(i);
+          }).reduce(ee.Reducer.sum())
+        );
+
+        var correct = ee.Number(row.get(i));
+
+        return ee.Feature(null, {
+          Crop_Class: i.add(1),
+          support: support,
+          predicted_support: predictedSupport,
+          correct: correct,
+          precision: ee.Algorithms.If(
+            predictedSupport.gt(0),
+            correct.divide(predictedSupport.max(1)),
+            null
+          ),
+          recall: ee.Algorithms.If(
+            support.gt(0),
+            correct.divide(support.max(1)),
+            null
+          )
+        });
+      })
+    );
+
+    var n = ee.Number(perClass.aggregate_sum('support'));
+    var correct = ee.Number(perClass.aggregate_sum('correct'));
+    var observed = correct.divide(n.max(1));
+
+    var expectedSum = perClass.map(function(f) {
+      return f.set(
+        '_product',
+        ee.Number(f.get('support'))
+          .multiply(ee.Number(f.get('predicted_support')))
+      );
+    }).aggregate_sum('_product');
+
+    var expected = ee.Number(expectedSum)
+      .divide(n.max(1).pow(2));
+
+    var metrics = ee.Dictionary({
+      status: ee.Algorithms.If(
+        n.gt(0),
+        'evaluated_supplied_validation',
+        'no_support'
+      ),
+      sample_count: n,
+      missing_predictor_rows: samples.size()
+        .subtract(complete.size()),
+      accuracy: ee.Algorithms.If(
+        n.gt(0), observed, null
+      ),
+      kappa: ee.Algorithms.If(
+        n.gt(0).and(expected.lt(1)),
+        observed.subtract(expected).divide(
+          ee.Number(1).subtract(expected).max(1e-12)
+        ),
+        null
+      ),
+      class_order: order,
+      confusion_rows_actual_columns_predicted: values,
+      independence_provenance: options.validationProvenance ||
+        'Caller must document independence; separation alone is not proof.',
+      source_geometry_checks_available: !!trainingSources,
+      spatial_buffer_m: buffer
+    }).combine(ee.Dictionary(extra || {}), true);
+
+    return {
+      predictions: predictions,
+      perClass: perClass,
+      matrix: matrix,
+      metrics: metrics
+    };
+  }
+
+  if (options.validationPoints && d.featureStack) {
+    var supplied = ee.FeatureCollection(
+      options.validationPoints
+    );
+
+    var labelled = labels(supplied);
+
+    var pointLabels = labelled.map(function(f) {
+      return f.set(
+        '_point_geometry',
+        ee.String(f.geometry().type())
+          .compareTo('Point')
+          .eq(0)
+      );
+    }).filter(ee.Filter.eq('_point_geometry', 1));
+
+    var separated = separate(pointLabels, true);
+
+    var sampled = d.featureStack.select(predictors)
+      .sampleRegions({
+        collection: separated,
+        properties: ['class', sourceProperty],
+        scale: C.SCALE,
+        projection: C.ANALYSIS_CRS,
+        geometries: true,
+        tileScale: 4
+      });
+
+    var independent = evaluate(sampled, {
+      supplied_locations: supplied.size(),
+      rejected_label_or_source: supplied.size()
+        .subtract(labelled.size()),
+      rejected_nonpoint_geometry: labelled.size()
+        .subtract(pointLabels.size()),
+      rejected_source_or_spatial_overlap: pointLabels.size()
+        .subtract(separated.size()),
+      unobserved_locations: separated.size()
+        .subtract(sampled.size()),
+      validation_period: 'Current inference featureStack; ' +
+        'caller supplies matching label season.'
+    });
+
+    d.independentValidationAvailable = true;
+    d.independentValidation = independent.predictions;
+    d.independentValidationPerClass = independent.perClass;
+    d.independentValidationMetrics = independent.metrics;
+    d.independentConfusionMatrix = independent.matrix;
+  }
+
+  if (
+    options.temporalValidationReady === true &&
+    options.temporalValidationSamples &&
+    typeof options.temporalValidationSeason === 'string' &&
+    options.temporalValidationSeason.length > 0
+  ) {
+    var historical = ee.FeatureCollection(
+      options.temporalValidationSamples
+    ).filter(ee.Filter.eq(
+      'season',
+      options.temporalValidationSeason
+    ));
+
+    var temporal = evaluate(
+      separate(labels(historical), false),
+      {
+        held_out_season: options.temporalValidationSeason,
+        provenance: options.temporalValidationProvenance ||
+          'Caller readiness declaration; independently audit held-out season.'
+      }
+    );
+
+    d.temporalValidationAvailable = true;
+    d.temporalValidation = temporal.predictions;
+    d.temporalValidationPerClass = temporal.perClass;
+    d.temporalValidationMetrics = temporal.metrics;
+
+    d.quality = d.quality.set(
+      'temporal_generalization',
+      'Supplied precomputed held-out-season table evaluated separately.'
+    );
+  }
+
+  return d;
+};
