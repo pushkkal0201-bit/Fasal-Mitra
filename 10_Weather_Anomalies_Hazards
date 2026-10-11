@@ -1,0 +1,361 @@
+exports.baselineYears = function(analysisDate, years) {
+  if (
+    typeof years !== 'number' ||
+    !isFinite(years) ||
+    years < 1 ||
+    years % 1 !== 0 ||
+    years > 50
+  ) {
+    throw new Error('Baseline years must be an integer from 1 to 50.');
+  }
+
+  var parsed = new Date(analysisDate);
+
+  if (!isFinite(parsed.getTime())) {
+    throw new Error('Invalid analysis date.');
+  }
+
+  var endYear = parsed.getUTCFullYear();
+  var result = [];
+
+  for (var year = endYear - years; year < endYear; year++) {
+    result.push(year);
+  }
+
+  return result;
+};
+
+exports.drySpellStats = function(rain, threshold) {
+  if (
+    typeof threshold !== 'number' ||
+    !isFinite(threshold) ||
+    threshold < 0
+  ) {
+    throw new Error(
+      'Dry-day threshold must be finite and nonnegative (mm/day).'
+    );
+  }
+
+  if (!rain || !rain.length) {
+    return null;
+  }
+
+  var dryDays = 0;
+  var run = 0;
+  var longest = 0;
+
+  for (var i = 0; i < rain.length; i++) {
+    if (rain[i] === null || rain[i] === undefined) {
+      return null;
+    }
+
+    if (
+      typeof rain[i] !== 'number' ||
+      !isFinite(rain[i]) ||
+      rain[i] < 0
+    ) {
+      throw new Error(
+        'Daily rain must be a finite nonnegative number.'
+      );
+    }
+
+    if (rain[i] < threshold) {
+      dryDays++;
+      run++;
+      longest = Math.max(longest, run);
+    } else {
+      run = 0;
+    }
+  }
+
+  return {
+    Dry_Days: dryDays,
+    Dry_Spell_Days: longest
+  };
+};
+
+exports.load = function(options) {
+  options = options || {};
+
+  var U = require(
+    'users/pushkkal0201/pheno-crop-analytics:modules/01_Data_Preprocessing'
+  );
+
+  var data = U.copy(options.data || {});
+  var C = data.CONFIG || options.config || {};
+
+  var years = C.BASELINE_YEARS === undefined
+    ? 10
+    : C.BASELINE_YEARS;
+
+  var dryThreshold = options.dryDayThresholdMm === undefined
+    ? 1
+    : options.dryDayThresholdMm;
+
+  exports.baselineYears(
+    C.ANALYSIS_DATE || '2026-01-01',
+    years
+  );
+  exports.drySpellStats([0], dryThreshold);
+
+  if (
+    !data.aoi ||
+    !data.recentStart ||
+    !data.END_DATE ||
+    !data.chirps ||
+    !data.era5
+  ) {
+    data.weatherAnomalies = U.empty(
+      ['Rain_Anomaly_pct', 'Temp_Anomaly_C'],
+      C
+    );
+
+    data.drySpellIndicators = U.empty(
+      ['Dry_Days', 'Dry_Spell_Days'],
+      C
+    );
+
+    data.weatherSummary = ee.Dictionary({
+      status: 'unavailable',
+      reason: 'Prepared AOI, recent dates, CHIRPS and ERA5 are required.'
+    });
+
+    return data;
+  }
+
+  var start = ee.Date(data.recentStart);
+  var end = ee.Date(data.END_DATE);
+
+  var analysisYear = C.ANALYSIS_DATE
+    ? ee.Number(Number(C.ANALYSIS_DATE.slice(0, 4)))
+    : end.advance(-1, 'second').get('year', 'Asia/Kolkata');
+
+  var sourceRain = ee.ImageCollection(
+    'UCSB-CHG/CHIRPS/DAILY'
+  ).filterBounds(data.aoi);
+
+  var sourceTemp = ee.ImageCollection(
+    'ECMWF/ERA5_LAND/HOURLY'
+  ).filterBounds(data.aoi);
+
+  function slots(a, b, millis) {
+    return b.millis().divide(millis).ceil()
+      .subtract(a.millis().divide(millis).ceil());
+  }
+
+  function complete(
+    collection, band, a, b, millis, reducer, outputName
+  ) {
+    var selected = ee.ImageCollection(collection)
+      .filterDate(a, b)
+      .select(band);
+
+    if (band === 'precipitation') {
+      selected = selected.map(function(image) {
+        return image.updateMask(image.gte(0));
+      });
+    }
+
+    var padded = selected.merge(
+      ee.ImageCollection.fromImages([
+        U.empty([band], C)
+      ])
+    );
+
+    var count = padded.count().rename('count').unmask(0);
+    var expected = slots(a, b, millis);
+
+    var value = reducer === 'sum'
+      ? padded.sum()
+      : padded.mean();
+
+    return value.rename(outputName).updateMask(
+      count.eq(expected)
+        .and(ee.Image.constant(expected.gt(0)))
+    );
+  }
+
+  var recentRain = complete(
+    data.chirps,
+    'precipitation',
+    start,
+    end,
+    86400000,
+    'sum',
+    'Rain_mm'
+  );
+
+  var recentTemp = complete(
+    data.era5,
+    'temperature_2m',
+    start,
+    end,
+    3600000,
+    'mean',
+    'Temp_C'
+  ).subtract(273.15);
+
+  var annual = ee.List.sequence(1, years)
+    .map(function(offset) {
+      offset = ee.Number(offset);
+
+      var shift = ee.Number(analysisYear)
+        .subtract(offset)
+        .subtract(analysisYear);
+
+      var a = start.advance(shift, 'year', 'Asia/Kolkata');
+      var b = end.advance(shift, 'year', 'Asia/Kolkata');
+
+      return complete(
+        sourceRain,
+        'precipitation',
+        a,
+        b,
+        86400000,
+        'sum',
+        'Rain_mm'
+      )
+        .addBands(
+          complete(
+            sourceTemp,
+            'temperature_2m',
+            a,
+            b,
+            3600000,
+            'mean',
+            'Temp_C'
+          ).subtract(273.15)
+        )
+        .set(
+          'baseline_year',
+          ee.Number(analysisYear).subtract(offset)
+        );
+    });
+
+  var baseline = ee.ImageCollection.fromImages(annual);
+  var baselineCount = baseline.count();
+
+  var normal = baseline.mean()
+    .updateMask(baselineCount.eq(years));
+
+  var rainNormal = normal.select('Rain_mm');
+
+  var rainAnomaly = recentRain
+    .subtract(rainNormal)
+    .divide(rainNormal)
+    .multiply(100)
+    .rename('Rain_Anomaly_pct')
+    .updateMask(rainNormal.gt(0));
+
+  var tempAnomaly = recentTemp
+    .subtract(normal.select('Temp_C'))
+    .rename('Temp_Anomaly_C');
+
+  data.weatherAnomalies = rainAnomaly
+    .addBands(tempAnomaly)
+    .clip(data.aoi);
+
+  data.weatherBaseline = normal
+    .rename(['Baseline_Rain_mm', 'Baseline_Temp_C'])
+    .clip(data.aoi);
+
+  data.weatherBaselineCounts = baselineCount
+    .rename(['Rain_Baseline_Years', 'Temp_Baseline_Years'])
+    .clip(data.aoi);
+
+  var orderedRain = ee.ImageCollection(data.chirps)
+    .filterDate(start, end)
+    .select('precipitation')
+    .sort('system:time_start');
+
+  var dryState = ee.Image(orderedRain.iterate(
+    function(observation, state) {
+      observation = ee.Image(observation);
+      state = ee.Image(state);
+
+      var dry = observation.lt(dryThreshold)
+        .updateMask(observation.gte(0));
+
+      var run = state.select('Dry_Run')
+        .add(1)
+        .multiply(dry)
+        .rename('Dry_Run');
+
+      return run
+        .addBands(
+          state.select('Dry_Days')
+            .add(dry)
+            .rename('Dry_Days')
+        )
+        .addBands(
+          state.select('Dry_Spell_Days')
+            .max(run)
+            .rename('Dry_Spell_Days')
+        );
+    },
+    ee.Image.constant([0, 0, 0])
+      .rename(['Dry_Run', 'Dry_Days', 'Dry_Spell_Days'])
+  ));
+
+  data.drySpellIndicators = dryState
+    .select(['Dry_Days', 'Dry_Spell_Days'])
+    .updateMask(recentRain.mask())
+    .clip(data.aoi);
+
+  var means = U.stats(
+    data.weatherAnomalies,
+    data.aoi,
+    C
+  );
+
+  var noRain = ee.Algorithms.IsEqual(
+    means.get('Rain_Anomaly_pct'),
+    null
+  );
+
+  var noTemp = ee.Algorithms.IsEqual(
+    means.get('Temp_Anomaly_C'),
+    null
+  );
+
+  data.weatherSummary = means
+    .combine(
+      U.stats(data.drySpellIndicators, data.aoi, C),
+      true
+    )
+    .combine(
+      U.stats(data.weatherBaselineCounts, data.aoi, C),
+      true
+    )
+    .combine(ee.Dictionary({
+      status: ee.Algorithms.If(
+        noRain,
+        ee.Algorithms.If(noTemp, 'unavailable', 'partial'),
+        ee.Algorithms.If(noTemp, 'partial', 'ready')
+      ),
+      baseline_years_required: years,
+      baseline_first_year: ee.Number(analysisYear)
+        .subtract(years),
+      baseline_last_year: ee.Number(analysisYear)
+        .subtract(1),
+      recent_start: start.format(),
+      recent_end_exclusive: end.format(),
+      units: 'Rain_Anomaly_pct=percent; Temp_Anomaly_C=degrees C',
+      coverage_rule: 'All expected daily rain and hourly temperature ' +
+        'observations in the recent window and every matched ' +
+        'baseline year; gaps masked.',
+      interpretation: 'Observed/reanalysis anomaly screening; ' +
+        'neither a forecast nor a flood diagnosis.',
+      dry_spell_status: 'Observed dry-day count and longest consecutive ' +
+        'dry-day run; gaps mask the entire indicator.',
+      dry_day_threshold_mm: dryThreshold,
+      inundation_status: 'unavailable: no supplied comparable SAR ' +
+        'history and validated inundation method',
+      sources: 'UCSB-CHG/CHIRPS/DAILY; ECMWF/ERA5_LAND/HOURLY',
+      spatial_scale_note: 'Weather native pixels are approximately ' +
+        '5.6 km CHIRPS and 11.1 km ERA5-Land; map/statistical ' +
+        'resampling does not add weather detail.'
+    }), true);
+
+  return data;
+};
