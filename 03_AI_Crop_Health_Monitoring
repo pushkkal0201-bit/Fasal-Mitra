@@ -1,0 +1,110 @@
+exports.load = function(options) {
+  var U = require(
+    'users/pushkkal0201/pheno-crop-analytics:modules/01_Data_Preprocessing'
+  );
+
+  var d = U.copy(options.data);
+  var C = d.CONFIG;
+
+  var mask = d.modelAvailable
+    ? d.classified.gte(1).and(d.classified.lte(7))
+    : d.croplandMask;
+
+  d.healthScore = d.NDVI.add(1).divide(2).multiply(0.5)
+    .add(d.NDMI.add(1).divide(2).multiply(0.3))
+    .add(d.NDWI.add(1).divide(2).multiply(0.2))
+    .multiply(100)
+    .clamp(0, 100)
+    .rename('Health_Score')
+    .updateMask(mask);
+
+  d.weightedStressScore = ee.Image.constant(100)
+    .subtract(d.healthScore)
+    .rename('Stress_Score');
+
+  d.monitoringStack = d.NDVI.addBands([
+    d.NDMI,
+    d.NDWI,
+    d.EVI,
+    d.temperature,
+    d.rainfall,
+    d.healthScore,
+    d.weightedStressScore
+  ]).updateMask(mask);
+
+  d.districtAverages = U.stats(
+    d.monitoringStack,
+    d.aoi,
+    C
+  );
+
+  var area = ee.Image.pixelArea()
+    .divide(10000)
+    .updateMask(mask)
+    .rename('area_ha');
+
+  d.totalCropArea = U.safeNumber(
+    area.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: d.aoi,
+      scale: C.SCALE,
+      crs: C.ANALYSIS_CRS,
+      maxPixels: 1e13,
+      tileScale: 4
+    }).get('area_ha'),
+    0
+  );
+
+  d.summaryScope = d.modelAvailable
+    ? 'Predicted active crops (IDs 1–7)'
+    : 'Reference mask; crop identity unavailable';
+
+  d.cropAnalytics = ee.FeatureCollection([]);
+
+  if (d.modelAvailable) {
+    var names = [
+      'NDVI', 'NDMI', 'NDWI', 'EVI',
+      'Temperature', 'Rainfall',
+      'Health_Score', 'Stress_Score'
+    ];
+
+    var result = d.monitoringStack
+      .select(names)
+      .addBands(d.classified)
+      .reduceRegion({
+        reducer: ee.Reducer.mean()
+          .forEach(names)
+          .group({
+            groupField: names.length,
+            groupName: 'ClassID'
+          }),
+        geometry: d.aoi,
+        scale: C.STATS_SCALE,
+        crs: C.ANALYSIS_CRS,
+        maxPixels: 1e13,
+        tileScale: 4
+      });
+
+    var cropNames = ee.List([
+      'Rice', 'Wheat', 'Sugarcane', 'Maize',
+      'Gram', 'Mustard', 'Vegetable', 'Fallow'
+    ]);
+
+    d.cropAnalytics = ee.FeatureCollection(
+      ee.List(ee.Dictionary(result).get('groups', []))
+        .map(function(group) {
+          var g = ee.Dictionary(group);
+
+          return ee.Feature(null, g).set(
+            'Crop',
+            cropNames.get(
+              ee.Number(g.get('ClassID')).subtract(1)
+            )
+          );
+        })
+    );
+  }
+
+  d.status03 = 'ready';
+  return d;
+};
