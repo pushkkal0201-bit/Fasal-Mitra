@@ -1,0 +1,238 @@
+exports.unavailableReason = function(options) {
+  var data = options.data || {};
+
+  if (
+    data.modelAvailable !== true ||
+    !data.classified
+  ) {
+    return 'A current available crop classification is required.';
+  }
+
+  if (!options.previousClassification) {
+    return 'A supplied previousClassification with Crop_Class is required.';
+  }
+
+  var period = options.previousPeriod;
+
+  if (
+    typeof period !== 'string' ||
+    !/^\d{4}-\d{2}-\d{2}(?:\/\d{4}-\d{2}-\d{2})?$/.test(period)
+  ) {
+    return 'previousPeriod requires dated ISO provenance ' +
+      '(YYYY-MM-DD or start/end).';
+  }
+
+  var parts = period.split('/');
+
+  for (var i = 0; i < parts.length; i++) {
+    var date = new Date(parts[i] + 'T00:00:00Z');
+
+    if (
+      !isFinite(date.getTime()) ||
+      date.toISOString().slice(0, 10) !== parts[i]
+    ) {
+      return 'previousPeriod requires valid dated ISO provenance.';
+    }
+  }
+
+  if (parts.length === 2 && parts[0] > parts[1]) {
+    return 'previousPeriod requires an ordered dated window.';
+  }
+
+  var config = data.CONFIG || options.config || {};
+
+  if (
+    config.ANALYSIS_DATE &&
+    parts[parts.length - 1] >= config.ANALYSIS_DATE
+  ) {
+    return 'previousPeriod must be earlier than the current analysis date.';
+  }
+
+  return null;
+};
+
+exports.load = function(options) {
+  options = options || {};
+
+  var U = require(
+    'users/pushkkal0201/pheno-crop-analytics:modules/01_Data_Preprocessing'
+  );
+
+  var data = U.copy(options.data || {});
+  var C = data.CONFIG || options.config || {};
+
+  data.fieldRotationSummary = ee.FeatureCollection([]);
+
+  var reason = exports.unavailableReason(options);
+
+  if (!reason && !data.aoi) {
+    reason = 'A prepared AOI is required.';
+  }
+
+  data.vegetationChange = data.temporalFeatures
+    ? data.temporalFeatures.select('NDVI_change')
+        .rename('Vegetation_Change_NDVI')
+    : U.empty(['Vegetation_Change_NDVI'], C);
+
+  data.rotationAvailable = !reason;
+
+  if (reason) {
+    data.cropChange = U.empty(['Crop_Change'], C);
+    data.transitions = ee.FeatureCollection([]);
+
+    data.rotationSummary = ee.Dictionary({
+      status: 'unavailable',
+      reason: reason,
+      vegetation_change_label: 'NDVI change only; ' +
+        'it does not establish historical crop identities.'
+    });
+
+    return data;
+  }
+
+  function validClasses(image) {
+    image = ee.Image(image).select('Crop_Class');
+
+    return image.updateMask(
+      image.gte(1)
+        .and(image.lte(8))
+        .and(image.eq(image.floor()))
+    );
+  }
+
+  var current = validClasses(data.classified);
+  var previous = validClasses(options.previousClassification);
+
+  data.cropChange = current.neq(previous)
+    .rename('Crop_Change')
+    .toByte()
+    .clip(data.aoi);
+
+  var code = previous.multiply(100)
+    .add(current)
+    .rename('Transition_Code')
+    .toInt();
+
+  var area = ee.Image.pixelArea()
+    .divide(10000)
+    .rename('Area_ha')
+    .updateMask(code.mask());
+
+  var grouped = area.addBands(code).reduceRegion({
+    reducer: ee.Reducer.sum().group({
+      groupField: 1,
+      groupName: 'transition'
+    }),
+    geometry: data.aoi,
+    scale: C.STATS_SCALE || C.SCALE || 100,
+    crs: C.ANALYSIS_CRS || 'EPSG:32644',
+    maxPixels: 1e9,
+    tileScale: 4
+  });
+
+  var groups = ee.List(
+    ee.Dictionary(grouped).get('groups', ee.List([]))
+  );
+
+  data.transitions = ee.FeatureCollection(
+    groups.map(function(entry) {
+      entry = ee.Dictionary(entry);
+
+      var key = ee.Number(entry.get('transition'));
+      var from = key.divide(100).floor();
+      var to = key.mod(100);
+
+      return ee.Feature(null, {
+        From_Class: from,
+        To_Class: to,
+        Area_ha: entry.get('sum'),
+        Changed: from.neq(to),
+        Previous_Period: options.previousPeriod
+      });
+    })
+  );
+
+  if (data.fieldsAvailable === true && data.validFields) {
+    var fieldAreas = area.rename('Compared_Area_ha')
+      .addBands(
+        area.multiply(data.cropChange)
+          .rename('Changed_Area_ha')
+      );
+
+    data.fieldRotationSummary = ee.FeatureCollection(
+      data.validFields
+    ).map(function(field) {
+      field = ee.Feature(field);
+
+      var totals = ee.Dictionary(fieldAreas.reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry: field.geometry(),
+        scale: C.STATS_SCALE || C.SCALE || 100,
+        crs: C.ANALYSIS_CRS || 'EPSG:32644',
+        maxPixels: 1e9,
+        tileScale: 4
+      }));
+
+      var compared = U.safeNumber(
+        totals.get('Compared_Area_ha'), 0
+      );
+
+      var changed = U.safeNumber(
+        totals.get('Changed_Area_ha'), 0
+      );
+
+      return ee.Feature(
+        field.geometry(),
+        totals
+      ).set({
+        field_id: field.get('field_id'),
+        Previous_Period: options.previousPeriod,
+        Changed_Percent: ee.Algorithms.If(
+          compared.gt(0),
+          changed.divide(compared.max(1e-9)).multiply(100),
+          null
+        ),
+        status: ee.Algorithms.If(
+          compared.gt(0),
+          'compared',
+          'no_valid_comparison'
+        ),
+        interpretation: 'Two-period classified crop-change screening; ' +
+          'not a verified multi-season rotation.'
+      });
+    });
+  }
+
+  data.rotationSummary = ee.Dictionary({
+    status: ee.Algorithms.If(
+      data.transitions.size().gt(0),
+      'ready',
+      'unavailable'
+    ),
+    previous_period: options.previousPeriod,
+    previous_model_version: options.previousModelVersion ||
+      'Not supplied; prior model provenance and validation ' +
+      'must be documented by the user.',
+    comparison_area_ha: data.transitions.aggregate_sum('Area_ha'),
+    changed_area_ha: data.transitions
+      .filter(ee.Filter.eq('Changed', 1))
+      .aggregate_sum('Area_ha'),
+    stable_area_ha: data.transitions
+      .filter(ee.Filter.eq('Changed', 0))
+      .aggregate_sum('Area_ha'),
+    interpretation: 'Transition screening from two supplied classified ' +
+      'periods; classification errors can appear as crop changes.',
+    vegetation_change_label: 'NDVI change only; not a crop-rotation classification.',
+    area_note: 'Approximate raster area at explicit statistical scale; ' +
+      'masked or invalid classes are excluded.',
+    statistics_scale_m: C.STATS_SCALE || C.SCALE || 100,
+    field_rotation_status:
+      data.fieldsAvailable === true && data.validFields
+        ? 'Approximate two-period change summary supplied for validated ' +
+          'field polygons; no multi-period rotation model.'
+        : 'unavailable: supply validated field polygons through Module08 ' +
+          'for per-field comparisons'
+  });
+
+  return data;
+};
