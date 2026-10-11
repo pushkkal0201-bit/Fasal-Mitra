@@ -1,0 +1,538 @@
+exports.stageEnabled = function(options) {
+  var crop = options.stageCropId;
+  var d = options.data || {};
+
+  return options.stageModelReady === true &&
+    !!options.stageTraining &&
+    !!options.stageDiagnostics &&
+    options.stageDiagnostics.can_train === true &&
+    typeof crop === 'number' &&
+    crop >= 1 && crop <= 8 &&
+    Math.floor(crop) === crop &&
+    d.modelAvailable === true &&
+    !!d.classified;
+};
+
+exports.curveSupport = function(rows) {
+  var values = rows.map(function(r) {
+    return r.NDVI;
+  }).filter(function(v) {
+    return typeof v === 'number' && isFinite(v);
+  });
+
+  var amplitude = values.length
+    ? Math.max.apply(null, values) -
+      Math.min.apply(null, values)
+    : null;
+
+  return {
+    count: values.length,
+    amplitude: amplitude,
+    available: values.length >= 4 && amplitude >= 0.1
+  };
+};
+
+exports.observedCurveRows = function(collection) {
+  return collection
+    .filter(ee.Filter.notNull(['NDVI']))
+    .filter(ee.Filter.gt('valid_fraction', 0))
+    .sort('time');
+};
+
+exports.prepare = function(options) {
+  var predictors = options.stagePredictors || [
+    'NDVI', 'NDMI', 'EVI'
+  ];
+
+  if (
+    !Array.isArray(predictors) ||
+    !predictors.length ||
+    predictors.some(function(name, i) {
+      return typeof name !== 'string' ||
+        !name.length ||
+        predictors.indexOf(name) !== i ||
+        [
+          'stage_id', 'crop_id', 'observation_date'
+        ].indexOf(name) >= 0;
+    })
+  ) {
+    throw new Error(
+      'stagePredictors must be unique nonempty predictor names, ' +
+      'excluding target/provenance properties.'
+    );
+  }
+
+  var source = options.stageTraining
+    ? ee.FeatureCollection(options.stageTraining)
+    : ee.FeatureCollection([]);
+
+  var crop = options.stageCropId;
+
+  var cropValid = typeof crop === 'number' &&
+    crop >= 1 && crop <= 8 &&
+    Math.floor(crop) === crop;
+
+  source = cropValid
+    ? source.filter(ee.Filter.eq('crop_id', crop))
+    : ee.FeatureCollection([]);
+
+  var valid = source.filter(ee.Filter.notNull(
+    predictors.concat([
+      'stage_id', 'crop_id', 'observation_date'
+    ])
+  ));
+
+  var numberTypes = ee.List([
+    'Integer', 'Long', 'Float', 'Double', 'Number'
+  ]);
+
+  valid = valid.map(function(f) {
+    var numeric = ee.List(
+      predictors.concat(['stage_id'])
+    ).map(function(name) {
+      return ee.Number(numberTypes.contains(
+        ee.Algorithms.ObjectType(f.get(ee.String(name)))
+      ));
+    }).reduce(ee.Reducer.min());
+
+    return f.set('_numeric_schema', numeric)
+      .set(
+        '_date_type',
+        ee.Algorithms.ObjectType(f.get('observation_date'))
+      );
+  })
+    .filter(ee.Filter.eq('_numeric_schema', 1))
+    .filter(ee.Filter.eq('_date_type', 'String'));
+
+  valid = valid.map(function(f) {
+    return f.set(
+      '_dated_label',
+      ee.String(f.get('observation_date'))
+        .match('^\\d{4}-\\d{2}-\\d{2}($|T)')
+        .length()
+        .gt(0)
+    );
+  }).filter(ee.Filter.eq('_dated_label', 1));
+
+  valid = valid.map(function(f) {
+    var id = ee.Number(f.get('stage_id'));
+
+    return f.set(
+      '_integer_stage',
+      id.eq(id.floor()).and(id.gte(0))
+    );
+  }).filter(ee.Filter.eq('_integer_stage', 1));
+
+  var classes = valid
+    .aggregate_array('stage_id')
+    .distinct()
+    .sort();
+
+  var contiguous = ee.Number(ee.Algorithms.IsEqual(
+    classes,
+    ee.List.sequence(0, classes.size().subtract(1))
+  ));
+
+  var minimumSupport = ee.Number(ee.Algorithms.If(
+    classes.size().gt(0),
+    valid.aggregate_histogram('stage_id')
+      .values()
+      .reduce(ee.Reducer.min()),
+    0
+  ));
+
+  var missingPredictors = ee.List(predictors).removeAll(
+    options.data && options.data.featureStack
+      ? options.data.featureStack.bandNames()
+      : ee.List([])
+  );
+
+  return {
+    samples: valid,
+    predictors: predictors,
+    diagnostics: ee.Dictionary({
+      supplied: source.size(),
+      valid: valid.size(),
+      discarded: source.size().subtract(valid.size()),
+      stage_count: classes.size(),
+      stages: classes,
+      crop_id: cropValid ? crop : null,
+      missing_inference_predictors: missingPredictors,
+      minimum_stage_support: minimumSupport,
+      contiguous_zero_based_stage_ids: contiguous,
+      can_train: valid.size().gte(10)
+        .and(classes.size().gte(2))
+        .and(minimumSupport.gte(2))
+        .and(contiguous)
+        .and(missingPredictors.size().eq(0)),
+      provenance_check_required: true,
+      note: 'Technical support only; dated crop-specific stage ' +
+        'labels and independent validation remain required.'
+    })
+  };
+};
+
+exports.load = function(options) {
+  options = options || {};
+
+  var U = require(
+    'users/pushkkal0201/pheno-crop-analytics:modules/01_Data_Preprocessing'
+  );
+
+  var d = U.copy(options.data || {});
+  var C = d.CONFIG;
+  var zone = 'Asia/Kolkata';
+  var bands = ['NDVI', 'NDMI', 'NDWI', 'EVI'];
+  var empty = U.empty(bands, C);
+
+  function mean(collection) {
+    return ee.ImageCollection(collection.select(bands))
+      .merge(ee.ImageCollection.fromImages([empty]))
+      .mean()
+      .setDefaultProjection(C.ANALYSIS_CRS, null, C.SCALE)
+      .clip(d.aoi);
+  }
+
+  function coverage(image) {
+    var area = ee.Image.pixelArea().rename('area');
+
+    var settings = {
+      reducer: ee.Reducer.sum(),
+      geometry: d.aoi,
+      scale: C.STATS_SCALE,
+      crs: C.ANALYSIS_CRS,
+      maxPixels: 1e9,
+      tileScale: 4
+    };
+
+    var denominator = U.safeNumber(
+      area.reduceRegion(settings).get('area'), 0
+    );
+
+    var numerator = U.safeNumber(
+      area.updateMask(image.select('NDVI').mask())
+        .reduceRegion(settings)
+        .get('area'),
+      0
+    );
+
+    return ee.Number(ee.Algorithms.If(
+      denominator.gt(0),
+      numerator.divide(denominator.max(1)),
+      0
+    ));
+  }
+
+  function bin(start, finish, label) {
+    var subset = d.s2.filterDate(start, finish);
+
+    return mean(subset).set({
+      Month: label,
+      time: start.millis(),
+      'system:time_start': start.millis(),
+      window_start: start.format(
+        'YYYY-MM-dd HH:mm', zone
+      ),
+      window_end_exclusive: finish.format(
+        'YYYY-MM-dd HH:mm', zone
+      ),
+      scene_count: subset.size()
+    });
+  }
+
+  function series(collection) {
+    return ee.FeatureCollection(
+      collection.toList(collection.size())
+        .map(function(entry) {
+          var image = ee.Image(entry);
+          var fraction = coverage(image);
+
+          return ee.Feature(
+            null,
+            U.stats(image, d.aoi, C)
+          ).set({
+            Month: image.get('Month'),
+            time: image.get('time'),
+            scene_count: image.get('scene_count'),
+            valid_fraction: fraction,
+            window_start: image.get('window_start'),
+            window_end_exclusive: image.get(
+              'window_end_exclusive'
+            ),
+            status: ee.Algorithms.If(
+              fraction.gt(0),
+              'observed',
+              'no_valid_observations'
+            )
+          });
+        })
+    );
+  }
+
+  var monthOrigin = ee.Date.fromYMD(
+    d.START_DATE.get('year', zone),
+    d.START_DATE.get('month', zone),
+    1,
+    zone
+  );
+
+  var lastInstant = ee.Date(
+    d.END_DATE.millis().subtract(1)
+  );
+
+  var months = lastInstant.get('year', zone)
+    .subtract(monthOrigin.get('year', zone))
+    .multiply(12)
+    .add(
+      lastInstant.get('month', zone)
+        .subtract(monthOrigin.get('month', zone))
+    )
+    .add(1)
+    .max(1);
+
+  d.monthlyImages = ee.ImageCollection.fromImages(
+    ee.List.sequence(0, months.subtract(1))
+      .map(function(n) {
+        var origin = monthOrigin.advance(n, 'month', zone);
+
+        var start = ee.Date(
+          origin.millis().max(d.START_DATE.millis())
+        );
+
+        var end = ee.Date(
+          origin.advance(1, 'month', zone)
+            .millis()
+            .min(d.END_DATE.millis())
+        );
+
+        return bin(
+          start,
+          end,
+          origin.format('YYYY-MM', zone)
+        );
+      })
+  );
+
+  d.monthlySeries = series(d.monthlyImages);
+
+  var tenCount = d.END_DATE
+    .difference(d.START_DATE, 'day')
+    .divide(10)
+    .ceil()
+    .max(1);
+
+  d.tenDayImages = ee.ImageCollection.fromImages(
+    ee.List.sequence(0, tenCount.subtract(1))
+      .map(function(n) {
+        var start = d.START_DATE.advance(
+          ee.Number(n).multiply(10),
+          'day'
+        );
+
+        var end = ee.Date(
+          start.advance(10, 'day')
+            .millis()
+            .min(d.END_DATE.millis())
+        );
+
+        return bin(
+          start,
+          end,
+          start.format('YYYY-MM-dd', zone)
+        );
+      })
+  );
+
+  d.tenDaySeries = series(d.tenDayImages);
+
+  var historical = d.s2.select('NDVI')
+    .merge(ee.ImageCollection.fromImages([
+      empty.select('NDVI')
+    ]));
+
+  var priorStart = ee.Date(
+    d.recentStart.advance(-30, 'day')
+      .millis()
+      .max(d.START_DATE.millis())
+  );
+
+  var prior = mean(
+    d.s2.filterDate(priorStart, d.recentStart)
+  ).select('NDVI');
+
+  d.temporalFeatures = historical.mean()
+    .rename('NDVI_mean')
+    .addBands(historical.min().rename('NDVI_min'))
+    .addBands(historical.max().rename('NDVI_max'))
+    .addBands(
+      historical.reduce(ee.Reducer.stdDev())
+        .rename('NDVI_sd')
+    )
+    .addBands(d.NDVI.subtract(prior).rename('NDVI_change'))
+    .setDefaultProjection(C.ANALYSIS_CRS, null, C.SCALE)
+    .clip(d.aoi);
+
+  var usable = exports.observedCurveRows(d.tenDaySeries);
+  var count = usable.size();
+
+  var low = U.safeNumber(
+    usable.aggregate_min('NDVI'), 0
+  );
+
+  var high = U.safeNumber(
+    usable.aggregate_max('NDVI'), 0
+  );
+
+  var supported = count.gte(4)
+    .and(high.subtract(low).gte(0.1));
+
+  var peak = ee.Feature(ee.Algorithms.If(
+    count.gt(0),
+    usable.sort('NDVI', false).first(),
+    ee.Feature(null, {
+      NDVI: 0,
+      time: 0,
+      Month: null
+    })
+  ));
+
+  var blankPoint = ee.Feature(null, {
+    NDVI: 0,
+    time: 0
+  });
+
+  var list = usable.toList(count)
+    .cat(ee.List([blankPoint, blankPoint]));
+
+  var differences = ee.FeatureCollection(
+    ee.Algorithms.If(
+      count.gte(2),
+      ee.List.sequence(1, count.subtract(1).max(1))
+        .map(function(i) {
+          i = ee.Number(i);
+
+          var current = ee.Feature(list.get(i));
+          var previous = ee.Feature(
+            list.get(i.subtract(1))
+          );
+
+          return current
+            .set(
+              'NDVI_delta',
+              ee.Number(current.get('NDVI'))
+                .subtract(ee.Number(previous.get('NDVI')))
+            )
+            .set(
+              'gap_days',
+              ee.Number(current.get('time'))
+                .subtract(ee.Number(previous.get('time')))
+                .divide(86400000)
+            );
+        }),
+      ee.List([])
+    )
+  ).filter(ee.Filter.lte('gap_days', 20));
+
+  var rising = differences
+    .filter(ee.Filter.lte('time', peak.get('time')))
+    .filter(ee.Filter.gte('NDVI_delta', 0.05))
+    .sort('time');
+
+  var falling = differences
+    .filter(ee.Filter.gt('time', peak.get('time')))
+    .filter(ee.Filter.lte('NDVI_delta', -0.05))
+    .sort('time');
+
+  function candidate(collection) {
+    return ee.Algorithms.If(
+      supported.and(collection.size().gt(0)),
+      collection.aggregate_min('time'),
+      null
+    );
+  }
+
+  d.phenologySummary = ee.FeatureCollection([
+    ee.Feature(null, {
+      curve_type: 'AOI mean NDVI; curve-derived event candidates',
+      observation_bins: count,
+      amplitude: ee.Algorithms.If(
+        count.gt(0), high.subtract(low), null
+      ),
+      status: ee.Algorithms.If(
+        supported,
+        'candidate_events',
+        'insufficient_curve_support'
+      ),
+      greenup_candidate_time: candidate(rising),
+      peak_candidate_time: ee.Algorithms.If(
+        supported, peak.get('time'), null
+      ),
+      senescence_candidate_time: candidate(falling),
+      minimum_bins: 4,
+      minimum_amplitude: 0.1,
+      step_threshold: 0.05,
+      maximum_gap_days: 20,
+      interpretation: 'Candidate observation-bin starts, not measured ' +
+        'sowing/harvest or crop-specific stages.'
+    })
+  ]);
+
+  d.stageModelAvailable = false;
+  d.stageClassifier = null;
+  d.stageClassification = U.empty(['Stage_ID'], C);
+
+  d.stageStatus = ee.Dictionary({
+    status: 'unavailable',
+    reason: 'Supply dated stageTraining and stageCropId1–8, ' +
+      'require crop classification, check prepare diagnostics ' +
+      'and set stageModelReady=true.'
+  });
+
+  if (exports.stageEnabled(options)) {
+    var prepared = exports.prepare(options);
+    var ready = prepared.diagnostics.get('can_train');
+
+    var classifier = ee.Classifier.smileRandomForest({
+      numberOfTrees: C.RF_TREES,
+      seed: C.RF_SEED
+    }).train({
+      features: prepared.samples,
+      classProperty: 'stage_id',
+      inputProperties: prepared.predictors
+    });
+
+    d.stageClassification = ee.Image(ee.Algorithms.If(
+      ready,
+      d.featureStack.select(prepared.predictors)
+        .classify(classifier)
+        .rename('Stage_ID')
+        .updateMask(d.classified.eq(options.stageCropId)),
+      U.empty(['Stage_ID'], C)
+    ));
+
+    d.stageClassifier = classifier;
+    d.stageModelAvailable = true;
+
+    d.stageStatus = prepared.diagnostics.set(
+      'status',
+      ee.Algorithms.If(
+        ready,
+        'enabled_by_caller',
+        'unavailable'
+      )
+    );
+  }
+
+  d.temporalStatus = ee.Dictionary({
+    status: ee.Algorithms.If(
+      count.gt(0), 'partial', 'unavailable'
+    ),
+    observed_bins: count,
+    scene_count: d.s2.size(),
+    semantics: 'Historical observation composites with explicit ' +
+      'masked gaps and heuristic AOI event candidates.'
+  });
+
+  d.status07 = 'partial';
+  return d;
+};
