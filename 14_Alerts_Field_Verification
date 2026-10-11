@@ -1,0 +1,441 @@
+function thresholds(options) {
+  options = options || {};
+
+  var values = {
+    priority: 50,
+    stress: 70,
+    disease: 0.6,
+    irrigation: 0.5,
+    heat: 0.5,
+    highPriority: 75
+  };
+
+  Object.keys(values).forEach(function(key) {
+    if (options[key] !== undefined) {
+      if (
+        typeof options[key] !== 'number' ||
+        !isFinite(options[key])
+      ) {
+        throw new Error(
+          'Alert threshold must be a finite number: ' + key
+        );
+      }
+
+      values[key] = options[key];
+    }
+  });
+
+  ['priority', 'stress', 'highPriority']
+    .forEach(function(key) {
+      if (values[key] < 0 || values[key] > 100) {
+        throw new Error(
+          'Score threshold must be between 0 and 100: ' + key
+        );
+      }
+    });
+
+  ['disease', 'irrigation', 'heat']
+    .forEach(function(key) {
+      if (values[key] < 0 || values[key] > 1) {
+        throw new Error(
+          'Flag fraction threshold must be between 0 and 1: ' + key
+        );
+      }
+    });
+
+  if (values.highPriority < values.priority) {
+    throw new Error('highPriority must be >= priority.');
+  }
+
+  return values;
+}
+
+var triggerDefinitions = [
+  {
+    property: 'Action_Priority',
+    threshold: 'priority',
+    instruction: 'Inspect high priority conditions'
+  },
+  {
+    property: 'Stress_Score',
+    threshold: 'stress',
+    instruction: 'Inspect vegetation/moisture stress'
+  },
+  {
+    property: 'Disease_Risk',
+    threshold: 'disease',
+    instruction: 'Inspect disease-risk indicator; no diagnosis'
+  },
+  {
+    property: 'Irrigation_Flag',
+    threshold: 'irrigation',
+    instruction: 'Check field moisture and irrigation availability'
+  },
+  {
+    property: 'Heat_Flag',
+    threshold: 'heat',
+    instruction: 'Check observed heat-stress conditions'
+  }
+];
+
+exports.thresholdEvidence = function(row, options) {
+  var limits = thresholds(options);
+
+  return triggerDefinitions.filter(function(definition) {
+    var value = row[definition.property];
+
+    return typeof value === 'number' &&
+      isFinite(value) &&
+      value >= limits[definition.threshold];
+
+  }).map(function(definition) {
+    return definition.instruction + ': ' +
+      definition.property + '=' +
+      row[definition.property] + ' >= ' +
+      limits[definition.threshold];
+  });
+};
+
+exports.latestInspection = function(records, locationId) {
+  var eligible = records.filter(function(record) {
+    return record.location_id === locationId &&
+      typeof record.observation_date === 'string' &&
+      /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d{3})?Z)?$/
+        .test(record.observation_date) &&
+      typeof record.status === 'string' &&
+      record.status.length > 0;
+  });
+
+  eligible.sort(function(a, b) {
+    function canonical(stamp) {
+      return stamp.length === 10
+        ? stamp + 'T00:00:00.000Z'
+        : stamp.length === 20
+          ? stamp.slice(0, 19) + '.000Z'
+          : stamp;
+    }
+
+    var first = canonical(a.observation_date) +
+      '|' + a.status + '|' + (a.finding || '');
+
+    var second = canonical(b.observation_date) +
+      '|' + b.status + '|' + (b.finding || '');
+
+    return first < second ? 1 : first > second ? -1 : 0;
+  });
+
+  return eligible.length ? eligible[0] : null;
+};
+
+exports.load = function(options) {
+  options = options || {};
+
+  var helper = require(
+    'users/pushkkal0201/pheno-crop-analytics:modules/01_Data_Preprocessing'
+  );
+
+  var data = options.data || {};
+  var output = helper.copy(data);
+  var limits = thresholds(options.alertThresholds);
+  var config = data.CONFIG || {};
+
+  var date = options.analysisDate ||
+    data.analysisDate ||
+    config.ANALYSIS_DATE ||
+    (
+      data.END_DATE
+        ? data.END_DATE.advance(-1, 'second')
+            .format('YYYY-MM-dd')
+        : null
+    );
+
+  var source = ee.FeatureCollection([]);
+
+  var evidenceProperties = [
+    'NDVI', 'NDMI', 'EVI', 'Temperature', 'Rainfall',
+    'Action_Priority', 'Stress_Score', 'Disease_Risk',
+    'Irrigation_Flag', 'Heat_Flag', 'valid_fraction'
+  ];
+
+  function safeValue(feature, property) {
+    var value = feature.get(property);
+
+    var isNumber = ee.List([
+      'Integer', 'Long', 'Float', 'Double', 'Number'
+    ]).contains(ee.Algorithms.ObjectType(value));
+
+    return ee.Number(ee.Algorithms.If(
+      isNumber,
+      helper.safeNumber(value, -9999),
+      -9999
+    ));
+  }
+
+  function locations(collection, kind, idProperty) {
+    return ee.FeatureCollection(collection)
+      .filter(ee.Filter.notNull([idProperty]))
+      .map(function(feature) {
+        feature = ee.Feature(feature);
+
+        var id = ee.Algorithms.If(
+          feature.propertyNames().contains('location_id'),
+          feature.get('location_id'),
+          ee.String(kind + ':')
+            .cat(ee.String(feature.get(idProperty)))
+        );
+
+        return feature.set({
+          location_id: id,
+          Location_Type: kind
+        });
+      })
+      .filter(ee.Filter.notNull(['location_id']));
+  }
+
+  if (data.fieldsAvailable === true && data.fieldAnalytics) {
+    source = locations(
+      data.fieldAnalytics,
+      'field',
+      'field_id'
+    );
+  } else if (data.gridRanking || data.analysisGrids) {
+    source = locations(
+      data.gridRanking || data.analysisGrids,
+      'grid',
+      'Grid_ID'
+    );
+  }
+
+  var ids = source.aggregate_array('location_id')
+    .distinct()
+    .sort();
+
+  var queue = ee.FeatureCollection(ids.map(function(locationId) {
+    var matching = source.filter(
+      ee.Filter.eq('location_id', locationId)
+    );
+
+    var first = ee.Feature(matching.first());
+    var summary = first;
+
+    triggerDefinitions.forEach(function(definition) {
+      var observed = matching.filter(
+        ee.Filter.notNull([definition.property])
+      );
+
+      summary = summary.set(
+        definition.property,
+        ee.Algorithms.If(
+          observed.size().gt(0),
+          observed.aggregate_max(definition.property),
+          null
+        )
+      );
+    });
+
+    var triggers = ee.List([]);
+
+    triggerDefinitions.forEach(function(definition) {
+      var threshold = limits[definition.threshold];
+
+      var exceeds = safeValue(
+        summary,
+        definition.property
+      ).gte(threshold);
+
+      var description = ee.String(
+        definition.instruction + ': ' +
+        definition.property + ' >= ' + threshold
+      );
+
+      triggers = ee.List(ee.Algorithms.If(
+        exceeds,
+        triggers.add(description),
+        triggers
+      ));
+    });
+
+    var severity = ee.Algorithms.If(
+      safeValue(summary, 'Action_Priority')
+        .gte(limits.highPriority),
+      'High',
+      'Attention'
+    );
+
+    var names = ee.List(evidenceProperties);
+
+    var present = names.removeAll(
+      names.removeAll(summary.propertyNames())
+    );
+
+    var evidence = summary.toDictionary(present);
+
+    return ee.Feature(first.geometry(), {
+      location_id: locationId,
+      Location_Type: first.get('Location_Type'),
+      Severity: severity,
+      Trigger: triggers.join('; '),
+      Evidence: evidence,
+      Analysis_Date: date,
+      Verification_Status: 'Unverified',
+      trigger_count: triggers.size(),
+      source_rows: matching.size(),
+      aggregation: 'Maximum trigger means if duplicate location rows; ' +
+        'evidence uses one source for other measurements.',
+      Model_Version: options.modelVersion ||
+        config.MODEL_VERSION ||
+        'unspecified',
+      Quality: ee.Algorithms.If(
+        first.propertyNames().contains('valid_fraction'),
+        first.get('valid_fraction'),
+        null
+      ),
+      Action: 'Inspect location and record finding, ' +
+        'observation date and verification status.'
+    });
+
+  })).filter(ee.Filter.gt('trigger_count', 0));
+
+  if (options.inspectionRecords) {
+    var inspections = ee.FeatureCollection(
+      options.inspectionRecords
+    )
+      .filter(ee.Filter.notNull([
+        'location_id', 'observation_date', 'status'
+      ]))
+      .map(function(feature) {
+        feature = ee.Feature(feature);
+
+        var typedDate = ee.Algorithms.IsEqual(
+          ee.Algorithms.ObjectType(
+            feature.get('observation_date')
+          ),
+          'String'
+        );
+
+        var typedStatus = ee.Algorithms.IsEqual(
+          ee.Algorithms.ObjectType(feature.get('status')),
+          'String'
+        );
+
+        var stamp = ee.String(ee.Algorithms.If(
+          typedDate,
+          feature.get('observation_date'),
+          ''
+        ));
+
+        var status = ee.String(ee.Algorithms.If(
+          typedStatus,
+          feature.get('status'),
+          ''
+        ));
+
+        var finding = ee.String(ee.Algorithms.If(
+          ee.Algorithms.IsEqual(feature.get('finding'), null),
+          '',
+          feature.get('finding')
+        ));
+
+        var shape = stamp.match(
+          '^[0-9]{4}-[0-9]{2}-[0-9]{2}' +
+          '(T[0-9]{2}:[0-9]{2}:[0-9]{2}' +
+          '(\\.[0-9]{3})?Z)?$'
+        ).length().gt(0);
+
+        var valid = ee.Number(ee.Algorithms.If(
+          shape, 1, 0
+        )).multiply(ee.Number(ee.Algorithms.If(
+          status.length().gt(0), 1, 0
+        )));
+
+        var canonical = ee.String(ee.Algorithms.If(
+          stamp.length().eq(10),
+          stamp.cat('T00:00:00.000Z'),
+          ee.Algorithms.If(
+            stamp.length().eq(20),
+            stamp.slice(0, 19).cat('.000Z'),
+            stamp
+          )
+        ));
+
+        return feature.set({
+          _inspection_valid: valid,
+          _inspection_key: canonical
+            .cat('|')
+            .cat(status)
+            .cat('|')
+            .cat(finding),
+          _inspection_canonical: canonical
+        });
+
+      }).filter(ee.Filter.eq('_inspection_valid', 1));
+
+    if (data.END_DATE) {
+      inspections = inspections.map(function(feature) {
+        return ee.Feature(feature).set(
+          '_inspection_millis',
+          ee.Date(
+            feature.get('_inspection_canonical')
+          ).millis()
+        );
+      }).filter(ee.Filter.lt(
+        '_inspection_millis',
+        data.END_DATE.millis()
+      ));
+    }
+
+    queue = queue.map(function(feature) {
+      feature = ee.Feature(feature);
+
+      var matches = inspections
+        .filter(ee.Filter.eq(
+          'location_id',
+          feature.get('location_id')
+        ))
+        .sort('_inspection_key', false);
+
+      var found = matches.size().gt(0);
+
+      var latest = ee.Feature(ee.Algorithms.If(
+        found,
+        matches.first(),
+        ee.Feature(null, {})
+      ));
+
+      return feature.set({
+        Verification_Status: ee.Algorithms.If(
+          found, latest.get('status'), 'Unverified'
+        ),
+        Verification_Date: ee.Algorithms.If(
+          found, latest.get('observation_date'), null
+        ),
+        Verification_Finding: ee.Algorithms.If(
+          found, latest.get('finding'), null
+        )
+      });
+    });
+  }
+
+  output.alertQueue = queue.sort('location_id');
+  output.alertThresholds = ee.Dictionary(limits);
+
+  output.alertSummary = ee.Dictionary({
+    count: queue.size(),
+    thresholds: limits,
+    semantics: 'Attention queue from field/grid summary means; ' +
+      'disease and stress values are heuristic inspection triggers.',
+    missingRecords: 'Unverified; absent records do not confirm healthy conditions.',
+    inspectionOrdering: 'Latest ISO UTC observation date, then descending ' +
+      'status/finding lexicographic tie break; no duplicate queue rows per location.',
+    persistence: 'User-triggered table export only; inspection inputs are read-only.'
+  });
+
+  output.alertStatus =
+    (data.fieldsAvailable === true && data.fieldAnalytics) ||
+    data.analysisGrids ||
+    data.gridRanking
+      ? 'ready'
+      : 'unavailable';
+
+  return output;
+};
