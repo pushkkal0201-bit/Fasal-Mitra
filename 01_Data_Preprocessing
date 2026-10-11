@@ -1,0 +1,400 @@
+exports.copy = function(source) {
+  var result = {};
+  Object.keys(source || {}).forEach(function(k) {
+    result[k] = source[k];
+  });
+  return result;
+};
+
+exports.safeNumber = function(value, fallback) {
+  if (value === null || value === undefined) {
+    return ee.Number(fallback);
+  }
+  return ee.Number(
+    ee.Algorithms.If(
+      ee.Algorithms.IsEqual(value, null),
+      fallback,
+      value
+    )
+  );
+};
+
+exports.empty = function(names, config) {
+  return ee.Image.constant(
+    names.map(function() { return 0; })
+  )
+    .rename(names)
+    .updateMask(ee.Image.constant(0))
+    .setDefaultProjection(
+      config.ANALYSIS_CRS,
+      null,
+      config.SCALE
+    );
+};
+
+exports.stats = function(image, aoi, config) {
+  return ee.Dictionary(image.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: aoi,
+    scale: config.STATS_SCALE,
+    crs: config.ANALYSIS_CRS,
+    maxPixels: 1e13,
+    tileScale: 4
+  }));
+};
+
+exports.dateWindow = function(config, nowMillis) {
+  config = config || {};
+
+  var now = nowMillis === undefined ? Date.now() : nowMillis;
+  var offset = 330 * 60000;
+  var today = new Date(now + offset).toISOString().slice(0, 10);
+  var text = config.ANALYSIS_DATE || today;
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    throw new Error('Invalid ANALYSIS_DATE; use YYYY-MM-DD.');
+  }
+
+  var parts = text.split('-').map(Number);
+  var day = Date.UTC(parts[0], parts[1] - 1, parts[2]);
+
+  if (new Date(day).toISOString().slice(0, 10) !== text) {
+    throw new Error('Invalid analysis date.');
+  }
+
+  if (text > today) {
+    throw new Error('Analysis date cannot be in the future.');
+  }
+
+  var month = new Date(Date.UTC(
+    parts[0],
+    parts[1] - 1 - 6,
+    1
+  ));
+
+  var last = new Date(Date.UTC(
+    month.getUTCFullYear(),
+    month.getUTCMonth() + 1,
+    0
+  )).getUTCDate();
+
+  var start = Date.UTC(
+    month.getUTCFullYear(),
+    month.getUTCMonth(),
+    Math.min(parts[2], last)
+  ) - offset;
+
+  var end = Math.min(day + 86400000 - offset, now);
+
+  return {
+    start: new Date(start).toISOString(),
+    end: new Date(end).toISOString(),
+    recentStart: new Date(
+      Math.max(start, end - 30 * 86400000)
+    ).toISOString(),
+    analysisDate: text
+  };
+};
+
+exports.load = function(options) {
+  options = options || {};
+
+  var C = {
+    COUNTRY: 'India',
+    STATE: 'Uttar Pradesh',
+    DISTRICT: 'Varanasi',
+    ANALYSIS_DATE: '',
+    TIME_PERIOD: '6_MONTHS',
+    ANALYSIS_CRS: 'EPSG:32644',
+    SCALE: 10,
+    STATS_SCALE: 100,
+    GRID_SCALE: 250,
+    GRID_METRES: 5000,
+    MAX_CLOUD: 80,
+    S1_ORBIT: 'ASCENDING',
+    USE_CROPLAND_MASK: true,
+    BASELINE_YEARS: 10,
+    RF_TREES: 150,
+    RF_SEED: 42,
+    TRAIN_FRACTION: 0.7,
+    VALIDATION_BUFFER_M: 500,
+    MIN_TRAIN_SAMPLES: 20,
+    MIN_CLASS_SAMPLES: 3,
+    MIN_TEST_SAMPLES: 5,
+    MAX_TRAIN_FEATURES: 5000,
+    EXPORT_FOLDER: 'PhenoCrop_Exports',
+    EXPORT_CRS: 'EPSG:4326'
+  };
+
+  Object.keys(options.config || {}).forEach(function(k) {
+    C[k] = options.config[k];
+  });
+
+  if (!(C.SCALE > 0 &&
+        C.STATS_SCALE > 0 &&
+        C.GRID_SCALE > 0 &&
+        C.GRID_METRES > 0)) {
+    throw new Error('Scales must be positive.');
+  }
+
+  if (!(C.MAX_CLOUD >= 0 && C.MAX_CLOUD <= 100)) {
+    throw new Error('MAX_CLOUD must be 0–100.');
+  }
+
+  if (!(C.TRAIN_FRACTION > 0 && C.TRAIN_FRACTION < 1)) {
+    throw new Error('TRAIN_FRACTION must be between 0 and 1.');
+  }
+
+  var window = exports.dateWindow(C, options.nowMillis);
+
+  C.ANALYSIS_DATE = window.analysisDate;
+  C.YEAR = Number(window.analysisDate.slice(0, 4));
+
+  var start = ee.Date(window.start);
+  var end = ee.Date(window.end);
+  var recent = ee.Date(window.recentStart);
+
+  var districts = ee.FeatureCollection('FAO/GAUL/2015/level2')
+    .filter(ee.Filter.eq('ADM0_NAME', C.COUNTRY))
+    .filter(ee.Filter.eq('ADM1_NAME', C.STATE))
+    .filter(ee.Filter.eq('ADM2_NAME', C.DISTRICT));
+
+  var aoi = options.aoi
+    ? ee.Geometry(options.aoi)
+    : districts.geometry();
+
+  var bands = [
+    'B2', 'B3', 'B4', 'B5', 'B6',
+    'B7', 'B8', 'B8A', 'B11', 'B12'
+  ];
+
+  function prep(image) {
+    var scl = image.select('SCL');
+
+    var good = scl.neq(0)
+      .and(scl.neq(1))
+      .and(scl.neq(3))
+      .and(scl.neq(8))
+      .and(scl.neq(9))
+      .and(scl.neq(10))
+      .and(scl.neq(11));
+
+    var x = image.updateMask(good)
+      .select(bands)
+      .divide(10000);
+
+    function nd(a, b, name) {
+      var sum = x.select(a).add(x.select(b));
+
+      return x.select(a)
+        .subtract(x.select(b))
+        .divide(sum)
+        .updateMask(sum.abs().gt(0.000001))
+        .rename(name);
+    }
+
+    var evi = x.expression(
+      '2.5*(n-r)/(n+6*r-7.5*b+1)',
+      {
+        n: x.select('B8'),
+        r: x.select('B4'),
+        b: x.select('B2')
+      }
+    ).rename('EVI');
+
+    return x.addBands([
+      nd('B8', 'B4', 'NDVI'),
+      nd('B8', 'B11', 'NDMI'),
+      nd('B3', 'B8', 'NDWI'),
+      evi
+    ]).copyProperties(image, [
+      'system:time_start',
+      'system:index'
+    ]);
+  }
+
+  var rawS2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(aoi)
+    .filterDate(start, end)
+    .filter(ee.Filter.lte(
+      'CLOUDY_PIXEL_PERCENTAGE',
+      C.MAX_CLOUD
+    ));
+
+  var s2 = rawS2.map(prep);
+
+  var spectral = bands.concat([
+    'NDVI', 'NDMI', 'NDWI', 'EVI'
+  ]);
+
+  function median(collection, names) {
+    return ee.Image(ee.Algorithms.If(
+      collection.size().gt(0),
+      collection.select(names).median(),
+      exports.empty(names, C)
+    ))
+      .setDefaultProjection(C.ANALYSIS_CRS, null, C.SCALE)
+      .clip(aoi);
+  }
+
+  var historical = median(s2, spectral);
+  var current = median(
+    s2.filterDate(recent, end),
+    spectral
+  );
+
+  var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterBounds(aoi)
+    .filterDate(start, end)
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .filter(ee.Filter.eq(
+      'orbitProperties_pass',
+      C.S1_ORBIT
+    ))
+    .filter(ee.Filter.listContains(
+      'transmitterReceiverPolarisation',
+      'VV'
+    ))
+    .filter(ee.Filter.listContains(
+      'transmitterReceiverPolarisation',
+      'VH'
+    ))
+    .select(['VV', 'VH']);
+
+  var radar = median(
+    s1.filterDate(recent, end),
+    ['VV', 'VH']
+  );
+
+  var chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+    .filterBounds(aoi)
+    .filterDate(start, end);
+
+  var era5 = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY')
+    .filterBounds(aoi)
+    .filterDate(start, end);
+
+  var rainRecent = chirps.filterDate(recent, end);
+  var tempRecent = era5.filterDate(recent, end);
+
+  var rainfall = ee.Image(ee.Algorithms.If(
+    rainRecent.size().gt(0),
+    rainRecent.select('precipitation')
+      .sum()
+      .rename('Rainfall'),
+    exports.empty(['Rainfall'], C)
+  )).clip(aoi);
+
+  var temperature = ee.Image(ee.Algorithms.If(
+    tempRecent.size().gt(0),
+    tempRecent.select('temperature_2m')
+      .mean()
+      .subtract(273.15)
+      .rename('Temperature'),
+    exports.empty(['Temperature'], C)
+  )).clip(aoi);
+
+  var worldcover = ee.ImageCollection('ESA/WorldCover/v200')
+    .first();
+
+  var reference = ee.Image(worldcover)
+    .select('Map')
+    .eq(40)
+    .rename('Cropland')
+    .clip(aoi);
+
+  var cropMask = C.USE_CROPLAND_MASK
+    ? reference
+    : ee.Image.constant(1).clip(aoi).rename('Cropland');
+
+  var terrain = ee.Terrain.products(
+    ee.Image('USGS/SRTMGL1_003').select('elevation')
+  ).select(['elevation', 'slope']);
+
+  var stack = current
+    .addBands(radar)
+    .addBands(terrain)
+    .updateMask(cropMask);
+
+  function lastDate(collection) {
+    return ee.Algorithms.If(
+      collection.size().gt(0),
+      ee.Date(exports.safeNumber(
+        collection.aggregate_max('system:time_start'),
+        0
+      )).format('yyyy-MM-dd HH:mm', 'Asia/Kolkata'),
+      'N/A'
+    );
+  }
+
+  var valid = exports.stats(
+    current.select('NDVI')
+      .mask()
+      .unmask(0, false)
+      .clip(aoi)
+      .rename('valid_fraction'),
+    aoi,
+    C
+  );
+
+  var metadata = ee.Dictionary({
+    analysis_date: C.ANALYSIS_DATE,
+    history_start: start.format(
+      'yyyy-MM-dd HH:mm', 'Asia/Kolkata'
+    ),
+    cutoff: end.format(
+      'yyyy-MM-dd HH:mm', 'Asia/Kolkata'
+    ),
+    recent_start: recent.format(
+      'yyyy-MM-dd HH:mm', 'Asia/Kolkata'
+    ),
+    sentinel2_scenes: s2.size(),
+    sentinel1_scenes: s1.size(),
+    recent_s2_scenes: s2.filterDate(recent, end).size(),
+    recent_rain_days: rainRecent.size(),
+    recent_temp_hours: tempRecent.size(),
+    latest_s2: lastDate(s2),
+    latest_s1: lastDate(s1),
+    latest_rain: lastDate(chirps),
+    latest_temperature: lastDate(era5),
+    valid_fraction: exports.safeNumber(
+      valid.get('valid_fraction'), 0
+    ),
+    districts: options.aoi ? 1 : districts.size(),
+    mask_source: C.USE_CROPLAND_MASK
+      ? 'ESA WorldCover 2021 cropland reference'
+      : 'Full AOI; no crop mask',
+    statistics_scale_m: C.STATS_SCALE,
+    analysis_crs: C.ANALYSIS_CRS
+  });
+
+  return {
+    CONFIG: C,
+    YEAR: C.YEAR,
+    aoi: aoi,
+    district: districts,
+    START_DATE: start,
+    END_DATE: end,
+    recentStart: recent,
+    s2: s2,
+    s1: s1,
+    chirps: chirps,
+    era5: era5,
+    s2Composite: historical,
+    recentS2: current,
+    recentS1: radar,
+    NDVI: current.select('NDVI'),
+    NDMI: current.select('NDMI'),
+    NDWI: current.select('NDWI'),
+    EVI: current.select('EVI'),
+    temperature: temperature,
+    rainfall: rainfall,
+    croplandMask: cropMask,
+    featureStack: stack,
+    metadata: metadata,
+    dataAvailability: metadata,
+    TIME_PERIOD: '6_MONTHS',
+    modelAvailable: false,
+    status01: 'ready'
+  };
+};
