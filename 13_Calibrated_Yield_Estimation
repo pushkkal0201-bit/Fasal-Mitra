@@ -1,0 +1,455 @@
+function predictorNames(names) {
+  names = names || ['NDVI', 'NDMI', 'EVI', 'Temperature'];
+
+  if (!Array.isArray(names) || !names.length) {
+    throw new Error(
+      'yieldPredictors must be a non-empty ordered array.'
+    );
+  }
+
+  var seen = {};
+
+  return names.map(function(name) {
+    if (typeof name !== 'string' || !name.length) {
+      throw new Error('Predictor names must be strings.');
+    }
+
+    if ([
+      'yield_t_ha', 'field_id', 'season', 'crop_id'
+    ].indexOf(name) >= 0) {
+      throw new Error(
+        'Predictor uses a reserved label/identity property.'
+      );
+    }
+
+    if (seen[name]) {
+      throw new Error('Predictor names must be unique.');
+    }
+
+    seen[name] = true;
+    return name;
+  });
+}
+
+exports.predictorNames = predictorNames;
+
+exports.excludeOverlappingFields = function(training, validation) {
+  var ids = {};
+
+  training.forEach(function(row) {
+    if (typeof row.field_id === 'string') {
+      ids['$' + row.field_id] = true;
+    }
+  });
+
+  return validation.filter(function(row) {
+    return typeof row.field_id === 'string' &&
+      row.field_id.length > 0 &&
+      !ids['$' + row.field_id];
+  });
+};
+
+exports.errorStats = function(rows) {
+  var squared = 0;
+  var absolute = 0;
+  var signed = 0;
+  var n = 0;
+
+  rows.forEach(function(row) {
+    if (
+      typeof row.yield_t_ha !== 'number' ||
+      !isFinite(row.yield_t_ha) ||
+      row.yield_t_ha < 0 ||
+      typeof row.Yield_t_ha !== 'number' ||
+      !isFinite(row.Yield_t_ha)
+    ) {
+      return;
+    }
+
+    var error = row.Yield_t_ha - row.yield_t_ha;
+    squared += error * error;
+    absolute += Math.abs(error);
+    signed += error;
+    n++;
+  });
+
+  return {
+    n: n,
+    RMSE: n ? Math.sqrt(squared / n) : null,
+    MAE: n ? absolute / n : null,
+    bias: n ? signed / n : null
+  };
+};
+
+function numeric(value) {
+  return ee.List([
+    'Integer', 'Long', 'Float', 'Double', 'Number'
+  ]).contains(ee.Algorithms.ObjectType(value));
+}
+
+function validString(value) {
+  var typed = ee.Algorithms.IsEqual(
+    ee.Algorithms.ObjectType(value),
+    'String'
+  );
+
+  return ee.Number(ee.Algorithms.If(
+    typed,
+    ee.String(
+      ee.Algorithms.If(typed, value, '')
+    ).length().gt(0),
+    0
+  ));
+}
+
+function schemaRows(collection, predictors) {
+  var required = predictors.concat([
+    'yield_t_ha', 'field_id', 'season', 'crop_id'
+  ]);
+
+  var present = collection.filter(
+    ee.Filter.notNull(required)
+  );
+
+  return present.map(function(feature) {
+    feature = ee.Feature(feature);
+    var valid = ee.Number(1);
+
+    predictors.concat(['yield_t_ha', 'crop_id'])
+      .forEach(function(name) {
+        valid = valid.multiply(
+          ee.Number(ee.Algorithms.If(
+            numeric(feature.get(name)), 1, 0
+          ))
+        );
+      });
+
+    return feature.set(
+      '_yield_schema',
+      valid
+        .multiply(validString(feature.get('field_id')))
+        .multiply(validString(feature.get('season')))
+    );
+  })
+    .filter(ee.Filter.eq('_yield_schema', 1))
+    .filter(ee.Filter.gte('yield_t_ha', 0))
+    .filter(ee.Filter.inList(
+      'crop_id',
+      ee.List.sequence(1, 8)
+    ));
+}
+
+exports.prepare = function(options) {
+  options = options || {};
+
+  var data = options.data || {};
+  var predictors = predictorNames(options.yieldPredictors);
+
+  var trainingRaw = ee.FeatureCollection(
+    options.yieldTraining || []
+  );
+
+  var validationRaw = ee.FeatureCollection(
+    options.yieldValidation || []
+  );
+
+  var validTraining = schemaRows(trainingRaw, predictors);
+  var validValidation = schemaRows(validationRaw, predictors);
+  var crop = options.yieldCropId;
+
+  var validCrop = typeof crop === 'number' &&
+    crop >= 1 && crop <= 8 &&
+    Math.floor(crop) === crop;
+
+  var cropInferenceAvailable = validCrop &&
+    data.modelAvailable === true &&
+    !!data.classified;
+
+  var training = validCrop
+    ? validTraining.filter(ee.Filter.eq('crop_id', crop))
+    : ee.FeatureCollection([]);
+
+  var usableValidation = validCrop
+    ? validValidation.filter(ee.Filter.eq('crop_id', crop))
+    : ee.FeatureCollection([]);
+
+  var validation = ee.FeatureCollection(
+    ee.Join.inverted().apply(
+      usableValidation,
+      training,
+      ee.Filter.equals({
+        leftField: 'field_id',
+        rightField: 'field_id'
+      })
+    )
+  );
+
+  var inference = options.yieldInference ||
+    data.analysisStack ||
+    data.monitoringStack ||
+    data.featureStack;
+
+  var missingBands = inference
+    ? ee.List(predictors).removeAll(inference.bandNames())
+    : ee.List(predictors);
+
+  var minimumTraining = options.yieldMinTraining === undefined
+    ? 20
+    : options.yieldMinTraining;
+
+  var minimumValidation = options.yieldMinValidation === undefined
+    ? 5
+    : options.yieldMinValidation;
+
+  if (
+    !(minimumTraining >= 2) ||
+    !(minimumValidation >= 1)
+  ) {
+    throw new Error(
+      'Yield minimum training/validation sizes must be >=2 / >=1.'
+    );
+  }
+
+  var canTrain = training.size().gte(minimumTraining)
+    .and(validation.size().gte(minimumValidation))
+    .and(missingBands.size().eq(0))
+    .and(validTraining.size().eq(trainingRaw.size()))
+    .and(validValidation.size().eq(validationRaw.size()))
+    .and(ee.Number(cropInferenceAvailable ? 1 : 0));
+
+  return {
+    training: training,
+    validation: validation,
+    predictors: predictors,
+    inference: inference,
+    diagnostics: ee.Dictionary({
+      canTrain: canTrain,
+      predictors: predictors,
+      yieldCropId: validCrop ? crop : null,
+      cropInferenceAvailable: cropInferenceAvailable,
+      prerequisiteReason: !validCrop
+        ? 'Require yieldCropId integer 1-8.'
+        : !cropInferenceAvailable
+          ? 'Require available crop classification to mask selected-crop inference.'
+          : 'Crop-specific prerequisites present; inspect counts/schema/bands.',
+      requiredProperties: predictors.concat([
+        'yield_t_ha', 'field_id', 'season', 'crop_id'
+      ]),
+      trainingRows: trainingRaw.size(),
+      usableTrainingRows: training.size(),
+      validationRows: validationRaw.size(),
+      usableValidationRows: usableValidation.size(),
+      independentValidationRows: validation.size(),
+      trainingRejected: trainingRaw.size()
+        .subtract(validTraining.size()),
+      validationRejected: validationRaw.size()
+        .subtract(validValidation.size()),
+      otherCropTrainingExcluded: validTraining.size()
+        .subtract(training.size()),
+      otherCropValidationExcluded: validValidation.size()
+        .subtract(usableValidation.size()),
+      overlappingValidationExcluded: usableValidation.size()
+        .subtract(validation.size()),
+      missingInferenceBands: missingBands,
+      trainingFields: training.aggregate_array('field_id')
+        .distinct().size(),
+      validationFields: validation.aggregate_array('field_id')
+        .distinct().size(),
+      trainingSeasons: training.aggregate_array('season')
+        .distinct().sort(),
+      validationSeasons: validation.aggregate_array('season')
+        .distinct().sort(),
+      trainingCrops: training.aggregate_array('crop_id')
+        .distinct().sort(),
+      validationCrops: validation.aggregate_array('crop_id')
+        .distinct().sort(),
+      minimumTraining: minimumTraining,
+      minimumValidation: minimumValidation,
+      warning: 'Technical sufficiency only. Verify measured yield units, ' +
+        'pre-harvest dates, crop/season support and identical historical ' +
+        'processing before approval. No current imagery is sampled ' +
+        'for historical labels.'
+    })
+  };
+};
+
+exports.load = function(options) {
+  options = options || {};
+
+  var helper = require(
+    'users/pushkkal0201/pheno-crop-analytics:modules/01_Data_Preprocessing'
+  );
+
+  var data = options.data || {};
+  var output = helper.copy(data);
+  var evaluated = options.yieldDiagnostics;
+
+  output.yieldAvailable = false;
+  output.yieldPrediction = helper.empty(
+    ['Yield_t_ha'],
+    data.CONFIG || {}
+  );
+  output.yieldValidationRows = ee.FeatureCollection([]);
+  output.yieldRegressor = null;
+
+  output.yieldMetrics = ee.Dictionary({
+    available: false,
+    reason: 'Selected crop_id, available crop classification, ' +
+      'measured historical training, independent validation, evaluated ' +
+      'passing diagnostics and explicit yieldModelReady are required.'
+  });
+
+  output.yieldStatus = 'unavailable';
+
+  if (
+    options.yieldModelReady !== true ||
+    !options.yieldTraining ||
+    !options.yieldValidation ||
+    !evaluated ||
+    evaluated.canTrain !== true ||
+    typeof options.yieldCropId !== 'number' ||
+    Math.floor(options.yieldCropId) !== options.yieldCropId ||
+    options.yieldCropId < 1 ||
+    options.yieldCropId > 8 ||
+    data.modelAvailable !== true ||
+    !data.classified
+  ) {
+    return output;
+  }
+
+  if (evaluated.yieldCropId !== options.yieldCropId) {
+    throw new Error(
+      'Yield diagnostics crop differs from selected inference crop.'
+    );
+  }
+
+  var prepared = options.yieldPrepared ||
+    exports.prepare(options);
+
+  var predictors = predictorNames(options.yieldPredictors);
+
+  if (
+    !Array.isArray(evaluated.predictors) ||
+    evaluated.predictors.join('\u0000') !==
+      predictors.join('\u0000')
+  ) {
+    throw new Error(
+      'Yield diagnostics predictor order differs from inference.'
+    );
+  }
+
+  if (
+    prepared.predictors.join('\u0000') !==
+      predictors.join('\u0000')
+  ) {
+    throw new Error(
+      'Prepared yield predictor order differs from inference.'
+    );
+  }
+
+  if (!prepared.inference) {
+    return output;
+  }
+
+  var config = data.CONFIG || {};
+
+  var regressor = ee.Classifier.smileRandomForest({
+    numberOfTrees: config.RF_TREES || 100,
+    seed: config.RF_SEED || 42
+  })
+    .setOutputMode('REGRESSION')
+    .train({
+      features: prepared.training,
+      classProperty: 'yield_t_ha',
+      inputProperties: predictors
+    });
+
+  var selected = prepared.inference.select(predictors);
+  var domain = selected.mask().reduce(ee.Reducer.min());
+  var range = ee.Dictionary({});
+
+  predictors.forEach(function(name) {
+    var minimum = prepared.training.aggregate_min(name);
+    var maximum = prepared.training.aggregate_max(name);
+
+    domain = domain
+      .and(selected.select(name).gte(ee.Number(minimum)))
+      .and(selected.select(name).lte(ee.Number(maximum)));
+
+    range = range.set(name, ee.Dictionary({
+      minimum: minimum,
+      maximum: maximum
+    }));
+  });
+
+  domain = domain.and(
+    data.classified.eq(options.yieldCropId)
+  );
+
+  var prediction = selected
+    .classify(regressor, 'Yield_t_ha')
+    .updateMask(domain);
+
+  if (data.croplandMask) {
+    prediction = prediction.updateMask(data.croplandMask);
+  }
+
+  var rows = prepared.validation
+    .classify(regressor, 'Yield_t_ha')
+    .map(function(feature) {
+      feature = ee.Feature(feature);
+
+      var error = ee.Number(feature.get('Yield_t_ha'))
+        .subtract(ee.Number(feature.get('yield_t_ha')));
+
+      return feature.set({
+        Error_t_ha: error,
+        Absolute_Error_t_ha: error.abs(),
+        Squared_Error: error.pow(2)
+      });
+    });
+
+  var n = rows.size();
+
+  output.yieldAvailable = true;
+  output.yieldPrediction = prediction;
+  output.yieldRegressor = regressor;
+  output.yieldDiagnostics = prepared.diagnostics;
+  output.yieldValidationRows = rows;
+
+  output.yieldMetrics = ee.Dictionary({
+    available: true,
+    n: n,
+    RMSE: ee.Algorithms.If(
+      n.gt(0),
+      ee.Number(rows.aggregate_mean('Squared_Error')).sqrt(),
+      null
+    ),
+    MAE: ee.Algorithms.If(
+      n.gt(0),
+      rows.aggregate_mean('Absolute_Error_t_ha'),
+      null
+    ),
+    bias: ee.Algorithms.If(
+      n.gt(0),
+      rows.aggregate_mean('Error_t_ha'),
+      null
+    ),
+    units: 't/ha',
+    biasDefinition: 'prediction minus observed yield',
+    trainingPredictorRanges: range,
+    validation: 'Held-out supplied fields; all overlapping training ' +
+      'field IDs excluded across seasons.',
+    intervalAvailable: false,
+    calibrated: false,
+    yieldCropId: options.yieldCropId,
+    applicability: 'Selected-crop model and classification mask only; ' +
+      'predictions masked outside training predictor ranges. Held-out ' +
+      'error metrics are not uncertainty calibration. Season transfer ' +
+      'and historical processing require independent review.',
+    modelVersion: options.yieldModelVersion || 'unspecified'
+  });
+
+  output.yieldStatus = 'ready';
+  return output;
+};
