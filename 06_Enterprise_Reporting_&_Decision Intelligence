@@ -1,0 +1,246 @@
+exports.load = function(options) {
+  options = options || {};
+
+  var U = require(
+    'users/pushkkal0201/pheno-crop-analytics:modules/01_Data_Preprocessing'
+  );
+
+  var d = U.copy(options.data);
+  var C = d.CONFIG;
+
+  d.districtReport = ee.FeatureCollection([
+    ee.Feature(null, d.districtAverages).set({
+      District: C.DISTRICT,
+      Analysis_Date: C.ANALYSIS_DATE,
+      Summary_Scope: d.summaryScope,
+      Model_Available: d.modelAvailable,
+      Statistics_Scale_m: C.STATS_SCALE,
+      Yield_ML_Available: d.yieldAvailable === true,
+      Heuristic_Yield_Units: 'index 0–100'
+    })
+  ]);
+
+  if (options.render !== true) {
+    return d;
+  }
+
+  var map = ui.Map();
+  map.style().set('stretch', 'both');
+  map.setOptions('SATELLITE');
+  map.centerObject(d.aoi, 10);
+
+  map.addLayer(
+    d.recentS2,
+    {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.3},
+    'Recent satellite RGB'
+  );
+
+  map.addLayer(
+    d.priorityMap,
+    {
+      min: 0,
+      max: 100,
+      palette: ['65DBAD', 'EDC565', 'D64E4E']
+    },
+    'Heuristic inspection priority',
+    false
+  );
+
+  var panel = ui.Panel({
+    style: {width: '470px', padding: '16px'}
+  });
+
+  function add(text, bold) {
+    panel.add(ui.Label(text, {
+      fontWeight: bold ? 'bold' : 'normal',
+      fontSize: bold ? '17px' : '12px',
+      margin: '6px 0'
+    }));
+  }
+
+  add('AI Pheno Crop Analytics — Report', true);
+  add(C.DISTRICT + ' | ' + C.ANALYSIS_DATE);
+  add(d.summaryScope);
+
+  add(
+    'Six-month history and recent 30-day conditions. ' +
+    'Health, stress, disease flags and yield index are heuristics. ' +
+    'ML yield is t/ha only when measured-label regression is enabled.'
+  );
+
+  if (options.onBack) {
+    panel.add(ui.Button({
+      label: 'Back to dashboard',
+      onClick: options.onBack
+    }));
+  }
+
+  var alive = true;
+
+  function dictionary(title, value) {
+    if (!value) {
+      return;
+    }
+
+    add(title, true);
+
+    var target = ui.Panel();
+    panel.add(target);
+
+    value.evaluate(function(result, error) {
+      if (!alive) {
+        return;
+      }
+
+      if (error) {
+        target.add(ui.Label('Unavailable: ' + error));
+        return;
+      }
+
+      Object.keys(result || {}).forEach(function(k) {
+        var v = result[k];
+
+        target.add(ui.Label(
+          k + ' : ' +
+          (
+            v === null
+              ? 'N/A'
+              : typeof v === 'object'
+                ? JSON.stringify(v)
+                : String(v)
+          )
+        ));
+      });
+    });
+  }
+
+  dictionary('Recent-period district means', d.districtAverages);
+  dictionary('Observation provenance', d.metadata);
+  dictionary('Classification holdout', d.validationMetrics);
+  dictionary('Independent validation', d.independentValidationMetrics);
+  dictionary('Measured-label yield validation', d.yieldMetrics);
+  dictionary('Weather anomalies', d.weatherSummary);
+  dictionary('Water demand screening', d.waterSummary);
+
+  if (d.monthlySeries) {
+    add('Monthly NDVI / moisture trend', true);
+
+    var chartPanel = ui.Panel();
+    panel.add(chartPanel);
+
+    d.monthlySeries.evaluate(function(fc, error) {
+      if (!alive) {
+        return;
+      }
+
+      if (error) {
+        chartPanel.add(ui.Label(
+          'Chart unavailable: ' + error
+        ));
+        return;
+      }
+
+      var features = fc && fc.features || [];
+
+      if (!features.length) {
+        chartPanel.add(ui.Label('No observations.'));
+        return;
+      }
+
+      var table = {
+        cols: [
+          {label: 'Month', type: 'string'},
+          {label: 'NDVI', type: 'number'},
+          {label: 'NDMI', type: 'number'}
+        ],
+        rows: features.map(function(f) {
+          var p = f.properties;
+
+          return {
+            c: [
+              {v: p.Month},
+              {
+                v: typeof p.NDVI === 'number' &&
+                  p.NDVI !== -9999 ? p.NDVI : null
+              },
+              {
+                v: typeof p.NDMI === 'number' &&
+                  p.NDMI !== -9999 ? p.NDMI : null
+              }
+            ]
+          };
+        })
+      };
+
+      chartPanel.add(
+        ui.Chart(table)
+          .setChartType('LineChart')
+          .setOptions({
+            lineWidth: 2,
+            pointSize: 3,
+            interpolateNulls: false,
+            colors: ['#229E75', '#267CBD']
+          })
+      );
+    });
+  }
+
+  add('Exports', true);
+  add(
+    'Click a button, then submit the created task in Tasks. ' +
+    'Raster and statistics scales are explicit; ' +
+    'weather remains coarse-resolution data.'
+  );
+
+  [
+    ['District_report', d.districtReport],
+    ['Monthly_trends', d.monthlySeries],
+    ['Grid_report', d.gridRanking],
+    ['Field_report', d.fieldAnalytics],
+    ['Inspection_queue', d.alertQueue]
+  ].forEach(function(item) {
+    if (item[1]) {
+      panel.add(ui.Button({
+        label: 'CSV • ' + item[0],
+        onClick: function() {
+          Export.table.toDrive({
+            collection: item[1],
+            description: 'Pheno_' + item[0] + '_' +
+              C.ANALYSIS_DATE.replace(/-/g, ''),
+            folder: C.EXPORT_FOLDER,
+            fileFormat: 'CSV'
+          });
+        }
+      }));
+    }
+  });
+
+  panel.add(ui.Button({
+    label: 'GeoTIFF • analysis indices',
+    onClick: function() {
+      Export.image.toDrive({
+        image: d.analysisStack.toFloat(),
+        region: d.aoi,
+        scale: C.SCALE,
+        crs: C.EXPORT_CRS,
+        description: 'Pheno_Analysis_' +
+          C.ANALYSIS_DATE.replace(/-/g, ''),
+        folder: C.EXPORT_FOLDER,
+        maxPixels: 1e13
+      });
+    }
+  }));
+
+  ui.root.clear();
+  ui.root.setLayout(ui.Panel.Layout.flow('horizontal'));
+  ui.root.add(map);
+  ui.root.add(panel);
+
+  d.reportPanel = panel;
+  d.reportMap = map;
+  d.closeReport = function() {
+    alive = false;
+  };
+
+  return d;
+};
