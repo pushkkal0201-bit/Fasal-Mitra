@@ -1,0 +1,278 @@
+exports.prepare = function(options) {
+  var U = require(
+    'users/pushkkal0201/pheno-crop-analytics:modules/01_Data_Preprocessing'
+  );
+
+  var d = options.data;
+  var C = d.CONFIG;
+
+  var source = ee.FeatureCollection(
+    options.trainingPoints || []
+  );
+
+  var crops = [
+    'Rice', 'Wheat', 'Sugarcane', 'Maize',
+    'Gram', 'Mustard', 'Vegetable', 'Fallow'
+  ];
+
+  if (!options.trainingPoints) {
+    crops.forEach(function(name, i) {
+      if (options.training && options.training[name]) {
+        source = source.merge(
+          ee.FeatureCollection(options.training[name])
+            .map(function(f) {
+              return f.set('class', i + 1);
+            })
+        );
+      }
+    });
+  }
+
+  source = source
+    .filterBounds(d.aoi)
+    .filter(ee.Filter.inList(
+      'class', [1, 2, 3, 4, 5, 6, 7, 8]
+    ))
+    .limit(C.MAX_TRAIN_FEATURES);
+
+  var list = source.toList(C.MAX_TRAIN_FEATURES);
+  var n = source.size();
+
+  var ids = ee.List(ee.Algorithms.If(
+    n.gt(0),
+    ee.List.sequence(0, n.subtract(1)),
+    ee.List([])
+  ));
+
+  source = ee.FeatureCollection(ids.map(function(i) {
+    var f = ee.Feature(list.get(i));
+
+    var original = ee.Algorithms.If(
+      ee.Algorithms.IsEqual(f.get('source_id'), null),
+      f.get('field_id'),
+      f.get('source_id')
+    );
+
+    var id = ee.String(ee.Algorithms.If(
+      ee.Algorithms.IsEqual(original, null),
+      ee.String('feature_').cat(ee.Number(i).format('%d')),
+      original
+    ));
+
+    return f.set({
+      _source_id: id,
+      source_id: id,
+      label_id: ee.Number(f.get('class')).subtract(1)
+    });
+  })).randomColumn(
+    '_split',
+    C.RF_SEED,
+    'uniform',
+    ['_source_id']
+  );
+
+  var trainSources = source.filter(
+    ee.Filter.lt('_split', C.TRAIN_FRACTION)
+  );
+
+  var testSources = source.filter(
+    ee.Filter.gte('_split', C.TRAIN_FRACTION)
+  );
+
+  if (C.VALIDATION_BUFFER_M > 0) {
+    trainSources = ee.FeatureCollection(
+      ee.Join.inverted().apply(
+        trainSources,
+        testSources,
+        ee.Filter.withinDistance({
+          distance: C.VALIDATION_BUFFER_M,
+          leftField: '.geo',
+          rightField: '.geo',
+          maxError: 1
+        })
+      )
+    );
+  }
+
+  var bands = d.featureStack.bandNames();
+
+  function sample(fc) {
+    return d.featureStack.sampleRegions({
+      collection: fc,
+      properties: [
+        'class', 'label_id', '_source_id',
+        'source_id', 'field_id'
+      ],
+      scale: C.SCALE,
+      projection: ee.Projection(C.ANALYSIS_CRS),
+      tileScale: 4,
+      geometries: false
+    }).filter(ee.Filter.notNull(bands));
+  }
+
+  var train = sample(trainSources);
+  var test = sample(testSources);
+
+  var classes = ee.List(
+    train.aggregate_array('class')
+  ).distinct().sort();
+
+  var support = ee.Dictionary(
+    train.aggregate_histogram('class')
+  );
+
+  var supported = classes.map(function(id) {
+    return ee.Number(ee.Algorithms.If(
+      ee.Number(support.get(
+        ee.Number(id).format('%d')
+      )).gte(C.MIN_CLASS_SAMPLES),
+      1,
+      0
+    ));
+  });
+
+  var minSupport = ee.Number(ee.Algorithms.If(
+    classes.size().gt(0),
+    supported.reduce(ee.Reducer.min()),
+    0
+  ));
+
+  var canTrain = train.size()
+    .gte(C.MIN_TRAIN_SAMPLES)
+    .and(classes.size().gte(2))
+    .and(minSupport.eq(1));
+
+  return {
+    training: train,
+    testing: test,
+    trainingSources: trainSources,
+    bands: bands,
+    diagnostics: ee.Dictionary({
+      canTrain: canTrain,
+      trainingSamples: train.size(),
+      testingSamples: test.size(),
+      trainingClasses: classes,
+      classSupport: support,
+      missingTrainingClasses: ee.List(
+        [1, 2, 3, 4, 5, 6, 7, 8]
+      ).removeAll(classes),
+      trainingSources: trainSources.size(),
+      testingSources: testSources.size(),
+      buffer_m: C.VALIDATION_BUFFER_M
+    })
+  };
+};
+
+exports.load = function(options) {
+  options = options || {};
+
+  var U = require(
+    'users/pushkkal0201/pheno-crop-analytics:modules/01_Data_Preprocessing'
+  );
+
+  var d = U.copy(options.data);
+  var C = d.CONFIG;
+
+  d.modelAvailable = false;
+  d.classifier = null;
+  d.classifierClassOffset = 1;
+  d.classified = U.empty(['Crop_Class'], C);
+  d.confidence = U.empty(['Confidence'], C);
+  d.trainingSamples = ee.FeatureCollection([]);
+  d.testingSamples = ee.FeatureCollection([]);
+  d.validationRows = ee.FeatureCollection([]);
+
+  d.validationMetrics = ee.Dictionary({
+    status: 'Unavailable: genuine usable training data required'
+  });
+
+  d.status02 = 'unavailable';
+
+  if (
+    options.modelReady !== true ||
+    !options.trainingDiagnostics ||
+    options.trainingDiagnostics.canTrain !== true
+  ) {
+    return d;
+  }
+
+  var p = options.prepared || exports.prepare(options);
+
+  var args = {
+    numberOfTrees: C.RF_TREES,
+    minLeafPopulation: 2,
+    bagFraction: 0.7,
+    seed: C.RF_SEED
+  };
+
+  var classifier = ee.Classifier.smileRandomForest(args)
+    .train({
+      features: p.training,
+      classProperty: 'label_id',
+      inputProperties: p.bands
+    });
+
+  var probability = ee.Classifier.smileRandomForest(args)
+    .setOutputMode('MULTIPROBABILITY')
+    .train({
+      features: p.training,
+      classProperty: 'label_id',
+      inputProperties: p.bands
+    });
+
+  d.classified = d.featureStack
+    .classify(classifier)
+    .add(1)
+    .rename('Crop_Class')
+    .toInt8()
+    .updateMask(d.croplandMask);
+
+  d.confidence = d.featureStack
+    .classify(probability)
+    .arrayReduce(ee.Reducer.max(), [0])
+    .arrayGet([0])
+    .multiply(100)
+    .rename('Confidence')
+    .updateMask(d.classified.mask());
+
+  d.validationRows = p.testing
+    .classify(classifier, 'predicted_internal')
+    .map(function(f) {
+      return f.set(
+        'predicted',
+        ee.Number(f.get('predicted_internal')).add(1)
+      );
+    });
+
+  var matrix = d.validationRows.errorMatrix(
+    'class',
+    'predicted',
+    [1, 2, 3, 4, 5, 6, 7, 8]
+  );
+
+  var available = p.testing.size().gte(C.MIN_TEST_SAMPLES);
+
+  d.validationMetrics = ee.Dictionary({
+    status: ee.Algorithms.If(
+      available,
+      'Spatially separated holdout',
+      'Insufficient holdout samples'
+    ),
+    count: p.testing.size(),
+    accuracy: ee.Algorithms.If(
+      available, matrix.accuracy(), null
+    ),
+    confusion: matrix.array()
+  });
+
+  d.classifier = classifier;
+  d.trainingSamples = p.training;
+  d.testingSamples = p.testing;
+  d.predictorNames = p.bands;
+  d.trainingSourceFeatures = p.trainingSources;
+  d.trainingDiagnostics = p.diagnostics;
+  d.modelAvailable = true;
+  d.status02 = 'ready';
+
+  return d;
+};
