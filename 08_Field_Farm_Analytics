@@ -1,0 +1,220 @@
+exports.load = function(options) {
+  options = options || {};
+
+  var U = require(
+    'users/pushkkal0201/pheno-crop-analytics:modules/01_Data_Preprocessing'
+  );
+
+  var d = U.copy(options.data || {});
+
+  d.fieldsAvailable = !!options.fields;
+  d.status08 = options.fields ? 'partial' : 'unavailable';
+  d.fieldAnalytics = ee.FeatureCollection([]);
+  d.fieldCropDistribution = ee.FeatureCollection([]);
+  d.validFields = ee.FeatureCollection([]);
+
+  d.fieldStatus = ee.Dictionary({
+    status: 'unavailable',
+    reason: 'Supply polygon fields with unique string field_id values.'
+  });
+
+  if (!options.fields) {
+    return d;
+  }
+
+  var C = d.CONFIG;
+  var supplied = ee.FeatureCollection(options.fields);
+
+  var nonnull = supplied.filter(
+    ee.Filter.notNull(['field_id'])
+  );
+
+  var checked = nonnull.map(function(f) {
+    var idType = ee.Algorithms.ObjectType(
+      f.get('field_id')
+    );
+
+    var type = f.geometry().type();
+
+    var polygon = ee.Number(
+      ee.List(['Polygon', 'MultiPolygon']).contains(type)
+    );
+
+    var stringID = ee.String(idType)
+      .compareTo('String')
+      .eq(0);
+
+    return f.set(
+      '_schema_ok',
+      polygon.and(stringID).and(
+        ee.String(f.get('field_id')).length().gt(0)
+      )
+    );
+  }).filter(ee.Filter.eq('_schema_ok', 1));
+
+  var histogram = checked.aggregate_histogram('field_id');
+
+  var unique = checked.map(function(f) {
+    return f.set(
+      '_id_count',
+      histogram.get(ee.String(f.get('field_id')))
+    );
+  }).filter(ee.Filter.eq('_id_count', 1));
+
+  var clipped = unique.map(function(f) {
+    var geometry = f.geometry().intersection(d.aoi, 1);
+
+    return ee.Feature(
+      geometry,
+      f.toDictionary()
+    ).set(
+      'area_ha',
+      geometry.area(1).divide(10000)
+    );
+  }).filter(ee.Filter.gt('area_ha', 0));
+
+  d.validFields = clipped;
+
+  var stack = d.analysisStack ||
+    d.monitoringStack ||
+    d.featureStack;
+
+  if (d.temporalFeatures) {
+    stack = stack.addBands(
+      d.temporalFeatures,
+      null,
+      true
+    );
+  }
+
+  if (d.yieldAvailable && d.yieldPrediction) {
+    stack = stack.addBands(
+      d.yieldPrediction,
+      null,
+      true
+    );
+  }
+
+  var reference = stack.select('NDVI');
+
+  function region(image, geometry) {
+    return image.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: geometry,
+      crs: C.ANALYSIS_CRS,
+      scale: C.STATS_SCALE,
+      maxPixels: 1e9,
+      tileScale: 4
+    });
+  }
+
+  d.fieldAnalytics = clipped.map(function(f) {
+    var geometry = f.geometry();
+    var area = ee.Image.pixelArea().rename('area');
+
+    var denominator = U.safeNumber(
+      region(area, geometry).get('area'),
+      0
+    );
+
+    var valid = U.safeNumber(
+      region(
+        area.updateMask(reference.mask()),
+        geometry
+      ).get('area'),
+      0
+    );
+
+    var fraction = ee.Number(ee.Algorithms.If(
+      denominator.gt(0),
+      valid.divide(denominator.max(1)),
+      0
+    ));
+
+    return ee.Feature(
+      geometry,
+      U.stats(stack, geometry, C)
+    ).set({
+      field_id: f.get('field_id'),
+      area_ha: f.get('area_ha'),
+      valid_fraction: fraction,
+      valid_fraction_basis: 'NDVI valid area / sampled polygon area',
+      stats_scale_m: C.STATS_SCALE,
+      status: ee.Algorithms.If(
+        fraction.gt(0),
+        'observed',
+        'no_valid_observations'
+      )
+    });
+  });
+
+  if (d.modelAvailable === true && d.classified) {
+    var perField = clipped.toList(clipped.size())
+      .map(function(entry) {
+        var f = ee.Feature(entry);
+        var geometry = f.geometry();
+
+        var validClassArea = U.safeNumber(
+          region(
+            ee.Image.pixelArea()
+              .updateMask(d.classified.mask())
+              .rename('area'),
+            geometry
+          ).get('area'),
+          0
+        );
+
+        return ee.List.sequence(1, 8)
+          .map(function(id) {
+            var ha = U.safeNumber(
+              region(
+                ee.Image.pixelArea()
+                  .updateMask(
+                    d.classified.eq(ee.Number(id))
+                  )
+                  .rename('area'),
+                geometry
+              ).get('area'),
+              0
+            ).divide(10000);
+
+            return ee.Feature(null, {
+              field_id: f.get('field_id'),
+              Crop_Class: id,
+              Area_ha: ha,
+              fraction_of_classified_area: ee.Algorithms.If(
+                validClassArea.gt(0),
+                ha.multiply(10000)
+                  .divide(validClassArea.max(1)),
+                null
+              ),
+              stats_scale_m: C.STATS_SCALE
+            });
+          });
+      });
+
+    d.fieldCropDistribution = ee.FeatureCollection(
+      ee.List(perField).flatten()
+    );
+  }
+
+  d.fieldStatus = ee.Dictionary({
+    status: ee.Algorithms.If(
+      clipped.size().gt(0), 'ready', 'unavailable'
+    ),
+    supplied_fields: supplied.size(),
+    valid_fields: clipped.size(),
+    rejected_schema: supplied.size()
+      .subtract(checked.size()),
+    rejected_duplicate_ids: checked.size()
+      .subtract(unique.size()),
+    outside_aoi: unique.size()
+      .subtract(clipped.size()),
+    area_semantics: 'Supplied polygons intersected with analysis AOI; ' +
+      'field_id duplicates are all rejected.',
+    statistics: 'Approximate raster means and valid area at STATS_SCALE; ' +
+      'small fields may contain no sampled pixels.'
+  });
+
+  return d;
+};
