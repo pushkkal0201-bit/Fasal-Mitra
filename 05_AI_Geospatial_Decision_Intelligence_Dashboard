@@ -1,0 +1,955 @@
+exports.format = function(value, digits) {
+  return typeof value === 'number' &&
+    isFinite(value) &&
+    value !== -9999
+    ? value.toFixed(digits === undefined ? 2 : digits)
+    : 'N/A';
+};
+
+exports.create = function(options) {
+  options = options || {};
+
+  var ink = '#0B1725';
+  var panel = '#132438';
+  var text = '#E8F0F5';
+  var green = '#65DBAD';
+
+  function label(value, bold) {
+    return ui.Label(value, {
+      color: bold ? green : text,
+      fontWeight: bold ? 'bold' : 'normal',
+      fontSize: bold ? '16px' : '12px',
+      backgroundColor: panel,
+      margin: '6px 4px'
+    });
+  }
+
+  var left = ui.Panel({
+    style: {
+      width: '290px',
+      padding: '12px',
+      backgroundColor: panel
+    }
+  });
+
+  var right = ui.Panel({
+    style: {
+      width: '400px',
+      padding: '12px',
+      backgroundColor: panel
+    }
+  });
+
+  var map = ui.Map();
+  map.style().set('stretch', 'both');
+  map.setOptions('SATELLITE');
+
+  var root = ui.Panel({
+    widgets: [left, map, right],
+    layout: ui.Panel.Layout.flow('horizontal'),
+    style: {
+      stretch: 'both',
+      backgroundColor: ink
+    }
+  });
+
+  left.add(label('PHENO / CROP', true));
+  left.add(label('Satellite intelligence • 14 modules'));
+
+  var status = label(
+    'Ready. Choose an analysis date and run.'
+  );
+  left.add(status);
+
+  left.add(label('Analysis date (India timezone)', true));
+
+  var date = ui.Textbox({
+    placeholder: 'YYYY-MM-DD; blank = today',
+    value: options.config &&
+      options.config.ANALYSIS_DATE || ''
+  });
+
+  left.add(date);
+  left.add(label(
+    'History: previous six calendar months\n' +
+    'Current view: recent 30 days'
+  ));
+
+  var state = ui.Textbox({
+    placeholder: 'State',
+    value: options.config &&
+      options.config.STATE || 'Uttar Pradesh'
+  });
+
+  var district = ui.Textbox({
+    placeholder: 'District',
+    value: options.config &&
+      options.config.DISTRICT || 'Varanasi'
+  });
+
+  left.add(label('Location', true));
+  left.add(state);
+  left.add(district);
+
+  var current = null;
+  var generation = 0;
+  var viewToken = 0;
+  var clickToken = 0;
+  var baseLayer = null;
+  var layers = {};
+
+  var runButton = ui.Button({
+    label: 'Run / Refresh analysis',
+    onClick: function() {
+      if (options.onRun) {
+        options.onRun({
+          ANALYSIS_DATE: date.getValue(),
+          STATE: state.getValue(),
+          DISTRICT: district.getValue()
+        });
+      }
+    },
+    style: {
+      stretch: 'horizontal',
+      color: '#0B1725',
+      backgroundColor: green
+    }
+  });
+
+  left.add(runButton);
+
+  var tab = ui.Select({
+    items: [
+      'Overview',
+      'Trends & phenology',
+      'Fields & grids',
+      'Weather & water',
+      'Quality & models',
+      'Alerts',
+      'Exports'
+    ],
+    value: 'Overview',
+    onChange: function() {
+      showTab();
+    },
+    style: {stretch: 'horizontal'}
+  });
+
+  left.add(label('Analytics workspace', true));
+  left.add(tab);
+
+  var selector = ui.Select({
+    items: ['Recent satellite RGB'],
+    value: 'Recent satellite RGB',
+    onChange: function(name) {
+      chooseLayer(name);
+    },
+    style: {stretch: 'horizontal'}
+  });
+
+  left.add(label('Map layer', true));
+  left.add(selector);
+
+  var opacity = ui.Slider({
+    min: 0,
+    max: 1,
+    value: 1,
+    step: 0.05,
+    onChange: function(value) {
+      if (baseLayer) {
+        baseLayer.setOpacity(value);
+      }
+    },
+    style: {stretch: 'horizontal'}
+  });
+
+  left.add(opacity);
+
+  var legend = label('RGB: recent cloud-masked median');
+  left.add(legend);
+
+  left.add(ui.Button({
+    label: 'Reset map',
+    onClick: function() {
+      if (current) {
+        map.centerObject(current.aoi, 10);
+        opacity.setValue(1);
+        chooseLayer(selector.getValue());
+      }
+    }
+  }));
+
+  left.add(ui.Button({
+    label: 'Open report',
+    onClick: function() {
+      if (current && options.onReport) {
+        options.onReport(current);
+      }
+    }
+  }));
+
+  left.add(label(
+    'Observed indices, ML predictions and heuristic scores ' +
+    'are labelled separately. Acquisition dates show freshness.'
+  ));
+
+  var clickPanel = ui.Panel({
+    style: {
+      position: 'bottom-left',
+      width: '310px',
+      padding: '8px',
+      backgroundColor: panel
+    }
+  });
+
+  clickPanel.add(label(
+    'Click the map for a 100 m neighbourhood summary.'
+  ));
+  map.add(clickPanel);
+
+  function availableNumber(v) {
+    return typeof v === 'number' &&
+      isFinite(v) &&
+      v !== -9999;
+  }
+
+  function request(object, callback) {
+    var g = generation;
+    var v = viewToken;
+
+    object.evaluate(function(result, error) {
+      if (g !== generation || v !== viewToken) {
+        return;
+      }
+
+      if (error) {
+        right.add(label('Query failed: ' + String(error)));
+        return;
+      }
+
+      callback(result);
+    });
+  }
+
+  function properties(dict) {
+    Object.keys(dict || {}).forEach(function(key) {
+      var val = dict[key];
+
+      right.add(label(
+        key.replace(/_/g, ' ') + ' : ' +
+        (
+          typeof val === 'number'
+            ? exports.format(val)
+            : typeof val === 'object'
+              ? JSON.stringify(val)
+              : String(val)
+        )
+      ));
+    });
+  }
+
+  function chart(collection, title, keys, domain) {
+    if (!collection) {
+      right.add(label('Series unavailable.'));
+      return;
+    }
+
+    right.add(label(title, true));
+
+    var chartPanel = ui.Panel();
+    right.add(chartPanel);
+
+    request(collection.limit(60), function(fc) {
+      var features = fc && fc.features || [];
+
+      if (!features.length) {
+        chartPanel.add(label(
+          'No observations for this period.'
+        ));
+        return;
+      }
+
+      var table = {
+        cols: [{label: domain, type: 'string'}]
+          .concat(keys.map(function(k) {
+            return {label: k, type: 'number'};
+          })),
+        rows: features.map(function(f) {
+          var p = f.properties;
+
+          return {
+            c: [{v: String(p[domain] || '')}]
+              .concat(keys.map(function(k) {
+                return {
+                  v: availableNumber(p[k]) ? p[k] : null
+                };
+              }))
+          };
+        })
+      };
+
+      chartPanel.add(
+        ui.Chart(table)
+          .setChartType('LineChart')
+          .setOptions({
+            title: title,
+            backgroundColor: '#FFFFFF',
+            colors: [
+              '#229E75', '#267CBD',
+              '#D48622', '#A362B0'
+            ],
+            lineWidth: 2,
+            pointSize: 4,
+            interpolateNulls: false,
+            legend: {position: 'bottom'},
+            hAxis: {slantedText: true},
+            chartArea: {
+              width: '76%',
+              height: '65%'
+            }
+          })
+      );
+    });
+  }
+
+  function table(collection, keys, limit) {
+    if (!collection) {
+      right.add(label('Unavailable.'));
+      return;
+    }
+
+    request(collection.limit(limit || 15), function(fc) {
+      var features = fc && fc.features || [];
+
+      if (!features.length) {
+        right.add(label('No valid records.'));
+        return;
+      }
+
+      features.forEach(function(f) {
+        var p = f.properties;
+
+        right.add(label(
+          keys.map(function(k) {
+            var value = availableNumber(p[k])
+              ? exports.format(p[k])
+              : p[k] === null || p[k] === undefined
+                ? 'N/A'
+                : String(p[k]);
+
+            return k + ': ' + value;
+          }).join('\n')
+        ));
+      });
+    });
+  }
+
+  function rasterButton(name, image) {
+    if (!image) {
+      return;
+    }
+
+    right.add(ui.Button({
+      label: 'GeoTIFF • ' + name,
+      onClick: function() {
+        Export.image.toDrive({
+          image: image.toFloat(),
+          description: 'Pheno_' + name + '_' +
+            current.CONFIG.ANALYSIS_DATE.replace(/-/g, ''),
+          folder: current.CONFIG.EXPORT_FOLDER,
+          region: current.aoi,
+          scale: current.CONFIG.SCALE,
+          crs: current.CONFIG.EXPORT_CRS,
+          maxPixels: 1e13
+        });
+
+        status.setValue(
+          'Export task created. Start it in Tasks.'
+        );
+      }
+    }));
+  }
+
+  function csvButton(name, collection) {
+    if (!collection) {
+      return;
+    }
+
+    right.add(ui.Button({
+      label: 'CSV • ' + name,
+      onClick: function() {
+        Export.table.toDrive({
+          collection: collection,
+          description: 'Pheno_' + name + '_' +
+            current.CONFIG.ANALYSIS_DATE.replace(/-/g, ''),
+          folder: current.CONFIG.EXPORT_FOLDER,
+          fileFormat: 'CSV'
+        });
+
+        status.setValue(
+          'CSV task created. Start it in Tasks.'
+        );
+      }
+    }));
+  }
+
+  function showTab() {
+    viewToken++;
+    right.clear();
+    right.add(label(tab.getValue(), true));
+
+    if (!current) {
+      right.add(label('Run an analysis to load results.'));
+      return;
+    }
+
+    var d = current;
+    var name = tab.getValue();
+
+    if (name === 'Overview') {
+      right.add(label(
+        d.CONFIG.DISTRICT + ' • ' +
+        d.CONFIG.ANALYSIS_DATE,
+        true
+      ));
+
+      right.add(label(
+        d.summaryScope || 'Satellite overview'
+      ));
+
+      right.add(label(
+        'Recent 30-day means; statistics at ' +
+        d.CONFIG.STATS_SCALE + ' m.'
+      ));
+
+      if (d.districtAverages) {
+        request(d.districtAverages, properties);
+      }
+
+      right.add(label(
+        'Crop classifier: ' +
+        (
+          d.modelAvailable
+            ? 'trained; inspect validation'
+            : 'unavailable — add labelled training samples'
+        )
+      ));
+
+      if (d.phenologySummary) {
+        table(d.phenologySummary, [
+          'status',
+          'observation_bins',
+          'amplitude',
+          'curve_type'
+        ], 1);
+      }
+
+    } else if (name === 'Trends & phenology') {
+      chart(
+        d.monthlySeries,
+        'Monthly vegetation / moisture',
+        ['NDVI', 'NDMI', 'EVI'],
+        'Month'
+      );
+
+      chart(
+        d.tenDaySeries,
+        'Ten-day NDVI development',
+        ['NDVI'],
+        'Month'
+      );
+
+      right.add(label(
+        'Gaps stay missing. Curve candidates require field verification.'
+      ));
+
+      if (d.phenologySummary) {
+        table(d.phenologySummary, [
+          'status',
+          'observation_bins',
+          'amplitude',
+          'greenup_candidate_time',
+          'peak_candidate_time',
+          'senescence_candidate_time'
+        ], 1);
+      }
+
+      if (d.stageStatus) {
+        request(d.stageStatus, properties);
+      }
+
+    } else if (name === 'Fields & grids') {
+      right.add(label(
+        d.fieldsAvailable
+          ? 'Supplied field polygons'
+          : 'No field polygons; showing analysis grids.'
+      ));
+
+      table(
+        d.fieldsAvailable
+          ? d.fieldAnalytics
+          : d.gridRanking,
+        d.fieldsAvailable
+          ? [
+              'field_id', 'area_ha', 'NDVI',
+              'Health_Score', 'Action_Priority'
+            ]
+          : [
+              'Grid_ID', 'NDVI',
+              'Health_Score', 'Action_Priority'
+            ],
+        20
+      );
+
+      if (d.fieldsAvailable) {
+        request(
+          d.fieldAnalytics.aggregate_array('field_id'),
+          function(ids) {
+            if (!ids || !ids.length) {
+              return;
+            }
+
+            var fieldSelect = ui.Select({
+              items: ids.slice(0, 100).map(String),
+              placeholder: 'Zoom to a field',
+              onChange: function(id) {
+                var field = d.fieldAnalytics.filter(
+                  ee.Filter.eq('field_id', id)
+                );
+
+                map.centerObject(field, 15);
+
+                map.layers().set(
+                  1,
+                  ui.Map.Layer(
+                    field.style({
+                      color: '65DBAD',
+                      fillColor: '00000000'
+                    }),
+                    {},
+                    'Selected field'
+                  )
+                );
+              }
+            });
+
+            right.add(fieldSelect);
+          }
+        );
+      }
+
+    } else if (name === 'Weather & water') {
+      right.add(label(
+        'Observed weather; no forecast. Weather has coarse native resolution.'
+      ));
+
+      if (d.weatherSummary) {
+        request(d.weatherSummary, properties);
+      }
+
+      if (d.waterSummary) {
+        request(d.waterSummary, properties);
+      }
+
+      right.add(label(
+        'Water demand is screening: ET0 and applicable Kc are required; ' +
+        'irrigation scheduling needs field inputs.'
+      ));
+
+      if (d.rotationSummary) {
+        request(d.rotationSummary, properties);
+      }
+
+    } else if (name === 'Quality & models') {
+      Object.keys(d)
+        .filter(function(k) {
+          return /Error$/.test(k);
+        })
+        .forEach(function(k) {
+          right.add(label(k + ' : ' + d[k]));
+        });
+
+      if (d.quality) {
+        request(d.quality, properties);
+      }
+      if (d.metadata) {
+        request(d.metadata, properties);
+      }
+      if (d.trainingDiagnostics) {
+        request(d.trainingDiagnostics, properties);
+      }
+      if (d.validationMetrics) {
+        request(d.validationMetrics, properties);
+      }
+      if (d.independentValidationMetrics) {
+        request(d.independentValidationMetrics, properties);
+      }
+      if (d.temporalValidationMetrics) {
+        request(d.temporalValidationMetrics, properties);
+      }
+      if (d.yieldMetrics) {
+        request(d.yieldMetrics, properties);
+      }
+      if (d.featureImportance) {
+        request(d.featureImportance, properties);
+      }
+
+      right.add(label(
+        'RF confidence is uncalibrated. Yield regression requires ' +
+        'measured historical labels and independent fields.'
+      ));
+
+    } else if (name === 'Alerts') {
+      right.add(label(
+        'Inspection queue • not a confirmed diagnosis'
+      ));
+
+      table(d.alertQueue, [
+        'location_id',
+        'Severity',
+        'Trigger',
+        'Verification_Status'
+      ], 25);
+
+    } else {
+      right.add(label(
+        'Buttons create tasks; submit them in the Tasks tab.'
+      ));
+
+      csvButton('Monthly_trends', d.monthlySeries);
+      csvButton('Grids', d.gridRanking);
+
+      if (d.fieldsAvailable) {
+        csvButton('Fields', d.fieldAnalytics);
+      }
+
+      csvButton('Alerts', d.alertQueue);
+      csvButton('Crop_analytics', d.cropAnalytics);
+
+      if (d.rotationAvailable) {
+        csvButton('Crop_transitions', d.transitions);
+      }
+
+      rasterButton(
+        'Recent_indices',
+        d.recentS2.select(['NDVI', 'NDMI', 'NDWI', 'EVI'])
+      );
+      rasterButton('Health_heuristic', d.healthScore);
+      rasterButton('Priority_heuristic', d.priorityMap);
+
+      if (d.modelAvailable) {
+        rasterButton('Crop_classification', d.classified);
+      }
+
+      if (d.yieldAvailable) {
+        rasterButton(
+          'Measured_label_yield_t_ha',
+          d.yieldPrediction
+        );
+      }
+
+      if (d.waterAvailable) {
+        rasterButton(
+          'Water_balance_screening',
+          d.waterBalance
+        );
+      }
+    }
+  }
+
+  function chooseLayer(name) {
+    var x = layers[name];
+
+    if (!x) {
+      return;
+    }
+
+    baseLayer = ui.Map.Layer(
+      x.image,
+      x.vis,
+      name,
+      true,
+      opacity.getValue()
+    );
+
+    map.layers().reset([baseLayer]);
+    legend.setValue(x.legend);
+  }
+
+  map.onClick(function(coords) {
+    if (!current || !current.analysisStack) {
+      return;
+    }
+
+    var g = generation;
+    var k = ++clickToken;
+    var d = current;
+
+    clickPanel.clear();
+    clickPanel.add(label(
+      'Loading ' + coords.lat.toFixed(4) + ', ' +
+      coords.lon.toFixed(4) + '…'
+    ));
+
+    var point = ee.Geometry.Point([
+      coords.lon,
+      coords.lat
+    ]);
+
+    d.analysisStack.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: point.buffer(100),
+      scale: d.CONFIG.STATS_SCALE,
+      crs: d.CONFIG.ANALYSIS_CRS,
+      maxPixels: 1e7,
+      tileScale: 4
+    }).evaluate(function(values, error) {
+      if (g !== generation || k !== clickToken) {
+        return;
+      }
+
+      clickPanel.clear();
+
+      if (error) {
+        clickPanel.add(label(
+          'Location query failed: ' + error
+        ));
+        return;
+      }
+
+      clickPanel.add(label(
+        '100 m neighbourhood; coarse weather is not field weather.',
+        true
+      ));
+
+      [
+        'NDVI', 'NDMI', 'Health_Score',
+        'Action_Priority', 'Temperature'
+      ].forEach(function(key) {
+        clickPanel.add(label(
+          key + ' : ' +
+          exports.format(values && values[key])
+        ));
+      });
+    });
+  });
+
+  var app = {
+    root: root,
+    map: map,
+    status: status,
+    runButton: runButton,
+
+    invalidate: function() {
+      generation++;
+      viewToken++;
+      clickToken++;
+      current = null;
+      map.layers().reset([]);
+      right.clear();
+      right.add(label('Loading analysis…'));
+    },
+
+    error: function(message) {
+      status.setValue(String(message));
+      status.style().set('color', '#FF958F');
+      runButton.setDisabled(false);
+    },
+
+    setBusy: function(busy) {
+      runButton.setDisabled(busy);
+    },
+
+    render: function(d) {
+      generation++;
+      current = d;
+
+      status.style().set('color', text);
+      status.setValue(
+        'Queries loading; explore the analytics tabs.'
+      );
+
+      runButton.setDisabled(false);
+      date.setValue(d.CONFIG.ANALYSIS_DATE);
+      map.centerObject(d.aoi, 10);
+
+      layers = {
+        'Recent satellite RGB': {
+          image: d.recentS2,
+          vis: {
+            bands: ['B4', 'B3', 'B2'],
+            min: 0,
+            max: 0.3
+          },
+          legend: 'Recent 30-day cloud-masked median'
+        },
+
+        'Six-month satellite RGB': {
+          image: d.s2Composite,
+          vis: {
+            bands: ['B4', 'B3', 'B2'],
+            min: 0,
+            max: 0.3
+          },
+          legend: 'Six-month historical median; not current-day imagery'
+        },
+
+        'Recent NDVI': {
+          image: d.NDVI,
+          vis: {
+            min: -0.2,
+            max: 0.9,
+            palette: [
+              'B8A77A', 'F1D485',
+              '62B878', '146641'
+            ]
+          },
+          legend: 'NDVI −0.2 to 0.9'
+        },
+
+        'Health heuristic': {
+          image: d.healthScore,
+          vis: {
+            min: 0,
+            max: 100,
+            palette: ['D64E4E', 'EDC565', '65DBAD']
+          },
+          legend: 'Heuristic health 0–100; not independently calibrated'
+        },
+
+        'Inspection priority': {
+          image: d.priorityMap,
+          vis: {
+            min: 0,
+            max: 100,
+            palette: ['65DBAD', 'EDC565', 'D64E4E']
+          },
+          legend: 'Heuristic priority 0–100; verify in field'
+        }
+      };
+
+      if (d.modelAvailable) {
+        layers['Crop classification'] = {
+          image: d.classified,
+          vis: {
+            min: 1,
+            max: 8,
+            palette: [
+              '229E75', 'E2B753', 'AD76BC', '56A7D5',
+              'E78B58', 'E2DB60', '8DD18A', '929DA5'
+            ]
+          },
+          legend: '1 Rice · 2 Wheat · 3 Sugarcane · 4 Maize · ' +
+            '5 Gram · 6 Mustard · 7 Vegetable · 8 Fallow'
+        };
+
+        layers['RF confidence'] = {
+          image: d.confidence,
+          vis: {
+            min: 0,
+            max: 100,
+            palette: ['D64E4E', 'EDC565', '65DBAD']
+          },
+          legend: 'Maximum RF class probability ×100; uncalibrated'
+        };
+      }
+
+      if (d.weatherAnomalies) {
+        layers['Rainfall anomaly'] = {
+          image: d.weatherAnomalies.select('Rain_Anomaly_pct'),
+          vis: {
+            min: -100,
+            max: 100,
+            palette: ['B9554B', 'FFFFFF', '4F9AC9']
+          },
+          legend: 'Rainfall anomaly % against matched historical window'
+        };
+      }
+
+      if (d.yieldAvailable) {
+        layers['ML yield t/ha'] = {
+          image: d.yieldPrediction,
+          vis: {
+            min: 0,
+            max: 10,
+            palette: ['F2D186', '4CBA89', '216947']
+          },
+          legend: 'Measured-label regression t/ha; inspect validation and applicability'
+        };
+      }
+
+      if (d.waterAvailable) {
+        layers['Water deficit screening'] = {
+          image: d.waterBalance.select('Deficit_mm'),
+          vis: {
+            min: 0,
+            max: 150,
+            palette: ['65DBAD', 'EDC565', 'D64E4E']
+          },
+          legend: 'Potential deficit mm; not an irrigation prescription'
+        };
+      }
+
+      if (d.rotationAvailable) {
+        layers['Crop change'] = {
+          image: d.cropChange,
+          vis: {
+            min: 0,
+            max: 1,
+            palette: ['85939D', 'EA6C83']
+          },
+          legend: '0 stable crop label; 1 changed label'
+        };
+      }
+
+      selector.items().reset(Object.keys(layers));
+      selector.setValue('Recent satellite RGB', false);
+      chooseLayer('Recent satellite RGB');
+      showTab();
+
+      var g = generation;
+
+      d.metadata.evaluate(function(meta, error) {
+        if (g !== generation) {
+          return;
+        }
+
+        if (error) {
+          app.error('Metadata query failed: ' + error);
+          return;
+        }
+
+        status.setValue(
+          'Analysis ' + d.CONFIG.ANALYSIS_DATE +
+          '\nLatest S2: ' + meta.latest_s2 +
+          '\nRecent valid AOI: ' +
+          exports.format(
+            (meta.valid_fraction || 0) * 100,
+            1
+          ) + '%'
+        );
+      });
+    }
+  };
+
+  ui.root.clear();
+  ui.root.setLayout(ui.Panel.Layout.flow('horizontal'));
+  ui.root.add(root);
+  showTab();
+
+  return app;
+};
+
+exports.load = function(options) {
+  var output = {};
+
+  Object.keys(options.data || {}).forEach(function(k) {
+    output[k] = options.data[k];
+  });
+
+  if (options.render !== false && options.ui) {
+    options.ui.render(output);
+  }
+
+  return output;
+};
